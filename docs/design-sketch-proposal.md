@@ -119,6 +119,19 @@ There are three delivery modes with different subscription mechanisms:
 
 The client SDK calls `events/poll` at the server-recommended interval. This is a protocol-level operation, NOT an LLM tool call.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SDK as Client SDK
+    participant Server as MCP Server
+
+    loop every nextPollSeconds
+        SDK->>Server: events/poll {subscriptions[], cursors}
+        Server-->>SDK: {results: [{events[], cursor}], nextPollSeconds}
+    end
+    Note over SDK: LLM invoked only when<br/>events[] is non-empty
+```
+
 #### Request: `events/poll`
 
 ```jsonc
@@ -223,6 +236,23 @@ The transport mechanism differs by transport type:
 - **Streamable HTTP:** The `events/stream` request is a POST that returns an SSE response stream. This replaces the GET-based SSE stream — `events/stream` is the sole server→client push channel. Connection close implicitly cancels — no explicit cancellation message is needed.
 - **stdio:** The `events/stream` request is sent on stdin. The server delivers events as JSON-RPC notifications on stdout. Since there is no connection to close, the client cancels by sending `notifications/cancelled` with the request's `id`.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SDK as Client SDK
+    participant Server as MCP Server
+
+    SDK->>Server: events/stream {id, subscriptions[]}
+    activate Server
+    Server-->>SDK: notifications/events/active {id, cursor} ×N
+    loop as events occur
+        Server-->>SDK: notifications/events/event {id, event, cursor}
+    end
+    SDK->>Server: notifications/cancelled {requestId} (stdio)<br/>— or connection close (Streamable HTTP)
+    Server-->>SDK: StreamEventsResult (final frame)
+    deactivate Server
+```
+
 #### Request: `events/stream`
 
 ```jsonc
@@ -279,7 +309,7 @@ Non-event MCP notifications (e.g., `notifications/tools/list_changed`, `notifica
 - **Stream termination.** The `StreamEventsResult` is an empty typed result (`{"_meta": {}}`) sent as the final message when the stream closes. It carries no information — it satisfies JSON-RPC's requirement that every request gets a response. All meaningful content is in the preceding notifications.
 - **Heartbeat.** The server MUST send periodic keepalive messages on the push stream so the client can distinguish "nothing to send" from "connection is dead." On Streamable HTTP, this is an SSE comment (`: keepalive\n\n`). On stdio, this is a `notifications/events/heartbeat` message. The server SHOULD send a heartbeat at least every 30 seconds. The client SHOULD treat absence of any data (events or heartbeats) beyond a threshold (e.g., 60 seconds) as connection failure and reconnect with cursors.
 - **Cancellation.** On Streamable HTTP, the client closes the connection. On stdio, the client sends `notifications/cancelled` with the `requestId` matching the `events/stream` request's `id`. In both cases, the server MUST stop delivering events, send the `StreamEventsResult`, and release any associated resources.
-- **Updating subscriptions.** To add, remove, or change subscriptions, the client cancels the current stream (connection close on HTTP, `notifications/cancelled` on stdio) and sends a new `events/stream` request with the updated subscription list and current cursors. The cursor-based replay ensures no events are missed during the brief transition.
+- **Updating subscriptions.** A client MAY hold multiple concurrent `events/stream` requests open, each with its own subscription list. To add subscriptions, open an additional stream; to remove them, cancel only the stream that carries them. Nothing prevents a client from instead consolidating onto a single stream by cancelling and re-issuing `events/stream` with the full updated list — cursor replay covers the transition gap — but this is an optimization, not a requirement. Note that on HTTP/1.1 each stream consumes a TCP connection, so clients that expect many independent subscriptions effectively depend on HTTP/2 multiplexing for the multi-stream approach to scale; SDKs SHOULD coalesce subscriptions onto fewer streams when the transport does not multiplex.
 - **Reconnection after failure.** If the connection drops (HTTP) or the server stops sending (stdio), the client sends a new `events/stream` with the same subscriptions and their last-known cursors.
 - **Empty subscriptions.** A client may open `events/stream` with an empty `subscriptions` array solely to receive non-event notifications (e.g., `notifications/tools/list_changed`).
 
@@ -295,6 +325,30 @@ The callback URL does not need to be the client itself. A common deployment is a
 
 ```
 Upstream → MCP Server → webhook POST → Forward Proxy ← Client (poll or push)
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SDK as Client SDK
+    participant Server as MCP Server
+    participant Hook as Webhook Endpoint
+
+    SDK->>Server: events/subscribe {id, name, params, delivery: {url}}
+    Server-->>SDK: {secret, cursor, refreshBefore}
+    loop as events occur
+        Server->>Hook: POST {id, event, cursor} + HMAC signature
+        Hook-->>Server: 200 OK
+        Hook--)SDK: deliver event (implementation-defined,<br/>e.g. forward proxy → poll/push)
+    end
+    loop before each refreshBefore
+        SDK->>Server: events/subscribe (same key — refreshes TTL)
+        Server-->>SDK: {refreshBefore'}
+    end
+    opt explicit teardown (else: stop refreshing → TTL expiry)
+        SDK->>Server: events/unsubscribe {id}
+        Server-->>SDK: (ack)
+    end
 ```
 
 #### Subscribing: `events/subscribe`
@@ -395,6 +449,7 @@ X-MCP-Timestamp: 1739980800
 - `X-MCP-Signature` contains an HMAC-SHA256 signature computed over `timestamp + "." + body` using the shared secret from subscription. The receiver MUST verify this before processing. The `X-MCP-Timestamp` header contains the Unix timestamp (seconds) of the request; the receiver SHOULD reject deliveries older than 5 minutes to prevent replay attacks.
 - `eventId` in the body enables idempotent processing. The receiver SHOULD deduplicate by this value.
 - The server SHOULD retry on non-2xx responses with exponential backoff.
+- **Acknowledgement semantics.** A `2xx` response from the webhook endpoint is a durability commitment: the endpoint MUST NOT return `2xx` until the event has either been durably persisted (e.g., written to a queue or store the end consumer reads from) or fully processed by the end consumer. The server advances the subscription's cursor on `2xx`; an endpoint that ACKs and then loses the event creates an unrecoverable gap. Endpoints that cannot satisfy this (e.g., a buffering proxy with no persistence) MUST hold the response until the downstream consumer has acknowledged. At-least-once delivery in webhook mode therefore holds between server and endpoint; end-to-end delivery to the agent depends on the endpoint honouring this contract.
 - **Subscribe/delivery race.** Because the server may begin delivering as soon as the subscription is persisted, the first webhook POST can arrive before the `events/subscribe` response (and thus the `secret`) reaches the client. The recommended handling for now is retry tolerance: a receiver that gets a delivery for an `id` it does not yet recognise, or that it cannot yet verify, SHOULD return a retryable status (e.g., `503` or `425 Too Early`) rather than dropping it; the server's normal retry/backoff machinery will redeliver once the client is ready. `eventId` deduplication and cursor replay make this safe. A two-phase activate handshake was considered and may be added later if this proves insufficient in practice.
 - After repeated failures (server-defined threshold), the server MAY stop retrying for the remainder of the TTL. The subscription will expire naturally, and the client's next refresh re-establishes it with cursor-based replay.
 
@@ -709,7 +764,7 @@ sub = await client.subscribe("incident.created", params={...}, delivery="webhook
 
 **Poll mode:** The SDK runs a background task that calls `events/poll` at the server-recommended interval, batching all subscriptions to the same server into a single request. Events are yielded to the subscription's async iterator. The caller does not implement or manage the polling loop.
 
-**Push mode:** The SDK sends an `events/stream` request and listens for notifications. When subscriptions are added or removed, the SDK cancels the current stream (via `notifications/cancelled` or connection close) and sends a new `events/stream` with the updated subscription list and current cursors. The transition gap is covered by cursor-based replay.
+**Push mode:** The SDK sends an `events/stream` request and listens for notifications. When subscriptions are added or removed, the SDK either opens an additional stream for the delta or — when the transport doesn't multiplex well (HTTP/1.1) — cancels the current stream and re-issues `events/stream` with the consolidated list and current cursors. Cursor-based replay covers any transition gap.
 
 **Webhook mode:** The SDK calls `events/subscribe` to register the callback URL with the server, which returns the signing secret. It runs a background refresh loop, re-calling `events/subscribe` before `refreshBefore` expires; if a refresh response includes a `secret`, the SDK updates the verifier. The SDK monitors `deliveryStatus` on each refresh to detect delivery failures. The webhook receiver (which may be a forward proxy) accepts incoming POSTs, verifies HMAC signatures, checks timestamp freshness, and routes events to the appropriate subscription iterator. On `sub.cancel()`, the SDK calls `events/unsubscribe` for eager cleanup.
 
@@ -820,3 +875,54 @@ What exists today is sufficient:
 Head-of-line blocking — where a slow-to-process event delays delivery of subsequent events — is likewise handled at the client SDK layer. The SDK can maintain per-subscription queues and let the agent framework process events concurrently or by priority, rather than strictly in arrival order.
 
 If future use cases involve high-throughput event streams where producer-side backpressure becomes necessary, a credit-based flow control extension can be added without breaking the existing protocol.
+
+## Appendix: End-to-End Example — GitHub MCP Server (Webhook Delivery)
+
+This walks one concrete topology from upstream source to agent reaction, using webhook delivery via a forward proxy. The MCP server wraps the GitHub API: it receives PR activity from GitHub via GitHub's native repository webhooks (the *upstream* channel — outside this protocol), and delivers it to a forward proxy via MCP webhook (`events/subscribe`). The proxy buffers events and serves them to the client over poll or push. When an event arrives, the client SDK wakes the LLM agent.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant LLM as LLM Agent
+    participant SDK as Client SDK
+    participant Proxy as Forward Proxy<br/>(webhook endpoint)
+    participant Server as GitHub MCP Server
+    participant Redis as Redis<br/>(sub store, TTL)
+    participant GH as GitHub.com<br/>(upstream)
+
+    rect rgb(245,245,250)
+        Note over SDK,Redis: Subscribe (webhook delivery)
+        SDK->>Server: events/subscribe<br/>{id, name: "pull_request.opened", params: {repo: "acme/webapp"},<br/>delivery: {mode: "webhook", url: "https://proxy/.../hooks"}}
+        Server->>Redis: SETEX sub:{id} {ttl}<br/>{url, params, secret, cursor}
+        Server->>GH: ensure repo webhook registered<br/>(server-internal, idempotent)
+        Server-->>SDK: {secret, cursor, refreshBefore}
+    end
+
+    rect rgb(245,250,245)
+        Note over GH,LLM: Event fires
+        GH->>Server: POST /gh-webhook<br/>{action: "opened", pull_request: {...}}
+        Server->>Redis: SCAN sub:* → match repo
+        Redis-->>Server: [{id, url, secret, cursor}]
+        Server->>Proxy: POST {id, event: {number: 42, title, author, url}, cursor'}<br/>+ HMAC signature
+        Proxy-->>Server: 200 OK
+        Proxy--)SDK: deliver event<br/>(implementation-defined, e.g. poll/push)
+        SDK->>LLM: invoke agent with event payload
+    end
+
+    rect rgb(250,245,245)
+        Note over SDK,Redis: Keepalive
+        SDK->>Server: events/subscribe (same key — refresh TTL)
+        Server->>Redis: EXPIRE sub:{id} {ttl}
+        Server-->>SDK: {refreshBefore'}
+    end
+    Note over Redis: no refresh → key expires,<br/>subscription gone
+```
+
+The Redis lane is illustrative, not normative. The body of this doc says webhook subscriptions are "in memory with TTL"; that is sufficient for a single-process server. A horizontally scaled server (multiple replicas behind a load balancer) needs *shared* state so any replica can match an incoming upstream event to subscriptions created on another replica — Redis with key TTL is the obvious fit, but any shared store with expiry works. The protocol does not require this state to be *durable*: if it is lost, clients re-create it on their next refresh and cursors cover the gap.
+
+Note there are *two* webhook hops here, and they are unrelated: GitHub → MCP Server (step 4) is GitHub's native webhook product, configured server-side and outside this spec; MCP Server → Forward Proxy (step 5) is the MCP `events/subscribe` webhook defined above.
+
+**Substituting other delivery modes.** Only the *Subscribe* and *Event fires* boxes change; the upstream leg (GitHub → MCP Server) is identical in all three modes.
+
+- **Push** — step 1 becomes `events/stream`; drop the Forward Proxy lane and the Keepalive box; steps 5–7 collapse into a single `notifications/events/event` from server to SDK (see [Push-Based Delivery](#push-based-delivery)).
+- **Poll** — drop step 1 and the Forward Proxy lane; the SDK loops `events/poll` with the subscription inline, and step 5–7 become the poll response (see [Poll-Based Delivery](#poll-based-delivery)).
