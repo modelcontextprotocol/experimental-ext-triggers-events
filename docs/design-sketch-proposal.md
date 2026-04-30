@@ -325,7 +325,7 @@ Unlike poll and push, webhook delivery requires an explicit subscribe step becau
     "delivery": {
       "mode": "webhook",
       "url": "https://proxy.example.com/hooks/client123",
-      "secret": "whsec_NWNmOGE3YjJkNGU2ZjgwMTIzNDU2Nzg5YWJjZGVmMDE"
+      "secret": "whsec_<base64-of-24-to-64-random-bytes>"
     },
     "cursor": null,
     "maxAge": 300
