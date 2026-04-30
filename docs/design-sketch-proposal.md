@@ -6,16 +6,13 @@
 
 ## Summary
 
-Add an Events primitive to MCP that allows clients to subscribe to things happening in the outside world (new email, Slack message, devops alert, scheduled reminder, etc.) and react to them. The design supports three delivery mechanisms — client-side polling, server-side push over an existing connection, and webhook delivery to an external endpoint — with a unified subscription API that abstracts the difference from application code.
+Events lets an MCP client subscribe to things happening in an upstream system — a Slack message, a GitHub push, a PagerDuty incident — and have the agent react when they occur, without the user being present. A server declares event types via `events/list` (each with a name, an `inputSchema` for subscription params, a `payloadSchema`, and the delivery modes it supports). The client subscribes with `(name, params)` and receives event occurrences `{eventId, name, timestamp, data, cursor}`.
 
-Key design principles:
+**Delivery modes.** Three, advertised per event type; none is mandatory. **Poll** (`events/poll`) is request/response: client sends `{name, params, cursor}`, gets back `{events[], cursor, nextPollSeconds}`. **Push** (`events/stream`) is a long-lived request: events arrive as `notifications/events/event`, with a heartbeat carrying the current cursor during quiet periods. **Webhook** (`events/subscribe`) registers an `https` callback URL plus a client-supplied `whsec_` secret; the server POSTs each event there, signed per Standard Webhooks (`webhook-id/-timestamp/-signature` + `X-MCP-Subscription-Id`); subscriptions have a TTL and the client refreshes before `refreshBefore`. The client SDK negotiates the mode and runs the loop; the model only sees arriving events.
 
-- **Servers advertise delivery modes; no mode is mandatory.** Each event type lists the delivery modes it supports. The client picks the best mode it can use. If there is no overlap between what the server offers and what the client can consume, that event type is simply unavailable to that client — the protocol does not require a universal fallback. (Reference SDKs are still encouraged to make poll cheap to support so that overlap is common in practice.)
-- **SDK-level polling, not LLM-level polling.** The client SDK drives the polling loop without burning LLM inference tokens. The LLM is only invoked when events actually arrive.
-- **No durable subscription state.** Poll holds no protocol-required subscription state — each request is self-describing. Push scopes subscription state to connection lifetime. Webhook uses soft state with mandatory TTL — the server holds subscriptions in memory, but they expire automatically if the client stops refreshing. The client is always the source of truth across all three modes. (This principle is about *protocol-required* state. SDKs MAY hold ephemeral derived state — a poll-lease table for lifecycle hooks, an emit ring buffer — but it is reconstructable from subsequent client requests, never persisted, and never owed to any particular client. Servers that relay from upstream sources will also hold upstream credentials, upstream webhook registrations, etc., all outside the protocol's concern.)
-- **Client owns subscription state.** In all modes, the client holds the canonical list of subscriptions. For poll and push, the server holds no protocol-required subscription state. For webhook, the server holds TTL-scoped subscription records, but the client drives their lifecycle via periodic refresh.
-- **Event payloads are untrusted data.** The spec must be explicit that event payloads carry the same injection risks as tool results.
-- **Servers own delivery.** Unlike traditional pub/sub (Kafka, SNS) where a shared broker decouples producers from subscribers, MCP servers run as independent processes with no central infrastructure. Each server handles event delivery itself, with the SDK absorbing the delivery complexity. In the common case, the server is a relay — ingesting events from an upstream system (GitHub webhooks, a Slack socket, a message bus) and routing them to subscribed clients — rather than the originating producer. Deployments that want a decoupled model can use a dedicated MCP server as a broker — no protocol changes required.
+**Cursors and replay.** A cursor is an opaque server-defined position. The client persists the cursor it receives and passes it back on the next poll/reconnect/refresh; the server resumes from there. Servers whose upstream has no addressable history return `cursor: null` (no replay). `maxAge` bounds replay so a stale cursor doesn't dump an unbounded backlog. `eventId` (preferably the upstream's stable id) is for client-side dedup. Reliable, ordered delivery is achievable when the upstream is durable, but not mandated — `truncated: true` in any response signals events were skipped (stale cursor, `maxAge` floor, or server-side ceiling).
+
+**State and identity.** The client owns the canonical subscription list; the server holds nothing durable. Poll is per-request; push is connection-scoped; webhook requires an authenticated principal and is TTL'd soft state keyed on `(principal, delivery.url, name, params)` — the response returns a server-derived `id` for routing only. `events/unsubscribe` is eager cleanup; otherwise subscriptions lapse on their own. Authorization is the same MCP principal as for tools; event payloads are untrusted data with the same injection considerations as tool results.
 
 ## Capability Declaration
 
@@ -112,12 +109,11 @@ There are three delivery modes with different subscription mechanisms:
 | `-32011` | `EventNotFound` | Unknown event name |
 | `-32012` | `Unauthorized` | User lacks permission for this event/params combination |
 | `-32013` | `TooManySubscriptions` | Server-imposed subscription limit reached |
-| `-32014` | `CursorExpired` | Cursor is no longer valid (upstream compacted, server reset); client must re-subscribe with `cursor: null` |
 | `-32015` | `InvalidCallbackUrl` | Webhook URL is unreachable or rejected by the server (webhook mode only) |
 | `-32016` | `SubscriptionNotFound` | No subscription matches the supplied key for `events/unsubscribe` (webhook mode only) |
 | `-32017` | `DeliveryModeUnsupported` | Event type does not support the requested delivery mode |
 
-These codes occupy `-32011..-32017` to avoid collision with base MCP error codes (e.g., `-32002 ResourceNotFound`).
+These codes are drawn from `-32011..-32017` (`-32014` is reserved/unused) to avoid collision with base MCP error codes (e.g., `-32002 ResourceNotFound`).
 
 ### Poll-Based Delivery
 
@@ -130,8 +126,8 @@ sequenceDiagram
     participant Server as MCP Server
 
     loop every nextPollSeconds
-        SDK->>Server: events/poll {id, name, params, cursor}
-        Server-->>SDK: {events[], cursor, nextPollSeconds, hasMore}
+        SDK->>Server: events/poll {name, params, cursor}
+        Server-->>SDK: {events[], cursor, truncated, hasMore, nextPollSeconds}
     end
     Note over SDK: LLM invoked only when<br/>events[] is non-empty
 ```
@@ -142,13 +138,13 @@ Each `events/poll` request carries one subscription. A client with multiple subs
 
 ```jsonc
 {
-  "id": "sub_email",              // client-provided routing identifier
   "name": "email.received",
   "params": {
     "from": "*@anthropic.com",
     "redact_pii": true
   },
   "cursor": null,                 // null = start from now
+  "maxAge": 300,                  // optional; do not replay events older than this many seconds (see Cursor Lifecycle)
   "maxEvents": 50                 // optional; cap events returned
 }
 ```
@@ -157,7 +153,6 @@ Each `events/poll` request carries one subscription. A client with multiple subs
 
 ```jsonc
 {
-  "id": "sub_email",
   "events": [
     {
       "eventId": "evt_001",
@@ -172,6 +167,7 @@ Each `events/poll` request carries one subscription. A client with multiple subs
     }
   ],
   "cursor": "historyId_99842",
+  "truncated": false,
   "hasMore": false,
   "nextPollSeconds": 30
 }
@@ -179,7 +175,7 @@ Each `events/poll` request carries one subscription. A client with multiple subs
 
 #### `EventOccurrence` schema
 
-Each entry in `events[]` (and the body of push/webhook deliveries) is an `EventOccurrence`:
+Each entry in `events[]`, the params of `notifications/events/event` (plus `requestId`), and the body of webhook event deliveries is an `EventOccurrence` (webhook also sends non-event control bodies — see *Non-event webhook bodies*):
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -191,7 +187,6 @@ Each entry in `events[]` (and the body of push/webhook deliveries) is an `EventO
 
 **Notes:**
 
-- `id` is a client-provided routing identifier. It is opaque to the server and echoed back in responses so the client can route results to the correct handler. It carries no uniqueness constraint — a client MAY reuse the same `id` for several subscriptions to fan results into a single handler.
 - `cursor` is opaque to the client. The client stores it and passes it back on the next poll. In the request, `null` means "start from now" — the server returns no events and provides a fresh cursor for subsequent polls. In the response, the server MAY return `cursor: null` for an event type that does not support replay; the client then has nothing to persist and always polls with `null` (see *Cursor Lifecycle*).
 - `eventId` enables client-side deduplication across polls (e.g., after a crash/restart). It is **server-assigned**: when the upstream source provides a stable event identifier (Stripe `evt_*`, GitHub delivery GUID, Kafka offset, Gmail message ID), the server SHOULD use that value as `eventId` so that the same upstream event surfaced via multiple paths (e.g., webhook emit and poll backfill) carries the same `eventId` and dedup works. The SDK auto-generates an `eventId` only when the author supplies none.
 - `maxEvents` is an optional cap on the number of events returned. If more events are available than the limit, the server returns a partial batch with an intermediate cursor and sets `hasMore: true`. The client SHOULD poll again immediately (ignoring `nextPollSeconds`) to drain the backlog. If omitted, the server uses its own default limit.
@@ -199,7 +194,7 @@ Each entry in `events[]` (and the body of push/webhook deliveries) is an `EventO
 - `nextPollSeconds` allows the server to dynamically adjust polling frequency (e.g., back off when rate-limited upstream, speed up when activity is detected). Ignored when `hasMore` is `true`. Clients SHOULD apply a configurable floor (default 1 second) to guard against a misbehaving server inducing a tight loop.
 - Empty `events` array means nothing happened — this is the common case and should be cheap.
 - The server holds no protocol-required per-client subscription state. Each poll request is self-contained: the client provides the event name, params, and cursor. The server does not need to "remember" previous poll requests to answer them. (The SDK MAY hold ephemeral derived state — a poll-lease table to drive `on_subscribe`/`on_unsubscribe`, and for emit-only event types a ring buffer of recent events — but neither is required to answer a poll, both are reconstructable, and neither is owed to any particular client. See *Unsubscribe timing by mode* and *Emit-only event types* under Server SDK Guidance.)
-- Errors (`EventNotFound`, `Unauthorized`, `CursorExpired`, `InvalidParams`) are returned as a standard JSON-RPC error response for the request — there is no partial-success model since each request carries one subscription.
+- Errors (`EventNotFound`, `Unauthorized`, `InvalidParams`, `DeliveryModeUnsupported`) are returned as a standard JSON-RPC error response for the request — there is no partial-success model since each request carries one subscription.
 
 ### Push-Based Delivery
 
@@ -216,11 +211,11 @@ sequenceDiagram
     participant SDK as Client SDK
     participant Server as MCP Server
 
-    SDK->>Server: events/stream {id, name, params, cursor}
+    SDK->>Server: events/stream {name, params, cursor}
     activate Server
-    Server-->>SDK: notifications/events/active {requestId, id, cursor}
+    Server-->>SDK: notifications/events/active {requestId, cursor, truncated}
     loop as events occur
-        Server-->>SDK: notifications/events/event {requestId, id, event, cursor}
+        Server-->>SDK: notifications/events/event {requestId, eventId, name, timestamp, data, cursor}
     end
     SDK->>Server: notifications/cancelled {requestId} (stdio)<br/>— or connection close (Streamable HTTP)
     Server-->>SDK: StreamEventsResult (final frame)
@@ -237,10 +232,10 @@ sequenceDiagram
   "method": "events/stream",
   "id": 1,
   "params": {
-    "id": "sub_email",
     "name": "email.received",
     "params": { "from": "*@anthropic.com", "redact_pii": true },
-    "cursor": null
+    "cursor": null,
+    "maxAge": 300
   }
 }
 ```
@@ -251,19 +246,19 @@ If the subscription is invalid (`EventNotFound`, `Unauthorized`, `InvalidParams`
 
 ```jsonc
 // Confirmation
-{"jsonrpc":"2.0","method":"notifications/events/active","params":{"requestId":1,"id":"sub_email","cursor":"historyId_99840"}}
+{"jsonrpc":"2.0","method":"notifications/events/active","params":{"requestId":1,"cursor":"historyId_99840","truncated":false}}
 
 // Events as they occur
-{"jsonrpc":"2.0","method":"notifications/events/event","params":{"requestId":1,"id":"sub_email","eventId":"evt_001","name":"email.received","timestamp":"2026-02-19T15:30:00Z","data":{"messageId":"msg_xyz","from":"dsp@anthropic.com","subject":"MCP spec review"},"cursor":"historyId_99842"}}
+{"jsonrpc":"2.0","method":"notifications/events/event","params":{"requestId":1,"eventId":"evt_001","name":"email.received","timestamp":"2026-02-19T15:30:00Z","data":{"messageId":"msg_xyz","from":"dsp@anthropic.com","subject":"MCP spec review"},"cursor":"historyId_99842"}}
 
 // Transient per-occurrence error (stream stays open)
-{"jsonrpc":"2.0","method":"notifications/events/error","params":{"requestId":1,"id":"sub_email","error":{"code":-32014,"message":"CursorExpired"}}}
+{"jsonrpc":"2.0","method":"notifications/events/error","params":{"requestId":1,"error":{"code":-32603,"message":"UpstreamError","data":{"reason":"Gmail API 503"}}}}
 
 // Final frame when stream closes (StreamEventsResult)
 {"jsonrpc":"2.0","id":1,"result":{"_meta":{}}}
 ```
 
-`notifications/events/error` reports a transient failure for the subscription (e.g., a single upstream fetch failed, or the cursor expired); the subscription remains active on the stream and the server keeps delivering subsequent events. Only `notifications/events/terminated` (see *Authorization*) ends the subscription.
+`notifications/events/error` reports a recoverable failure (e.g., a single upstream fetch failed); the subscription remains active and the server retries and resumes. Only `notifications/events/terminated` (see *Authorization*) ends the subscription. A gap (e.g., the cursor fell outside the upstream's retention window) is *not* an error — the server sends a fresh `notifications/events/active {requestId, cursor:<fresh>, truncated:true}` and continues delivering (see *Cursor Lifecycle*).
 
 On Streamable HTTP, notifications are SSE `data:` frames; when the server terminates the stream it sends the `StreamEventsResult` as the final `data:` frame, but when the client terminates by aborting the request stream no result can be sent (see *Cancellation*). On stdio, notifications are newline-delimited JSON messages on stdout.
 
@@ -272,9 +267,9 @@ The `events/stream` response carries only `notifications/events/*` messages. Non
 #### Lifecycle
 
 - **Stream termination.** The `StreamEventsResult` is an empty typed result (`{"_meta": {}}`). It carries no information — it satisfies JSON-RPC's requirement that every request gets a response. All meaningful content is in the preceding notifications. It is sent whenever the server can write a final frame: on Streamable HTTP only when the server initiates the close; on stdio the server MAY send it, and clients MUST NOT depend on receiving it.
-- **Heartbeat.** The server MUST send periodic keepalive messages on the push stream so the client can distinguish "nothing to send" from "connection is dead." On Streamable HTTP, this is an SSE comment (`: keepalive\n\n`). On stdio, this is `{"jsonrpc":"2.0","method":"notifications/events/heartbeat","params":{"requestId":1}}`. The server SHOULD send a heartbeat at least every 30 seconds. Clients SHOULD NOT apply their default request timeout to `events/stream`; the heartbeat is the liveness signal, and a client that has received neither an event nor a heartbeat for more than twice the heartbeat interval SHOULD treat the stream as dead and reconnect with its cursor.
+- **Heartbeat.** The server MUST send periodic keepalive messages on the push stream so the client can distinguish "nothing to send" from "connection is dead." The heartbeat is `{"jsonrpc":"2.0","method":"notifications/events/heartbeat","params":{"requestId":1,"cursor":"historyId_99850"}}` — `cursor` is the position the server has checked up to, so the client's persisted cursor advances even when no events match (see *Cursor Lifecycle*); it is `null` for event types that do not support replay. On Streamable HTTP this is sent as an SSE `data:` frame; the SSE comment form (`: keepalive`) is not used since it cannot carry cursor state. The server SHOULD send a heartbeat at least every 30 seconds. Clients SHOULD NOT apply their default request timeout to `events/stream`; the heartbeat is the liveness signal, and a client that has received neither an event nor a heartbeat for more than twice the heartbeat interval SHOULD treat the stream as dead and reconnect with its cursor.
 - **Cancellation.** On Streamable HTTP, the client aborts the request stream. On stdio, the client sends `notifications/cancelled` with the `requestId` matching the `events/stream` request's `id`. In both cases, the server MUST stop delivering events and release any associated resources. On stdio, the server MAY then send the `StreamEventsResult`; base MCP says servers SHOULD NOT respond to cancelled requests, so omitting it is the expected behaviour. On Streamable HTTP, the abort is the terminal signal and no result is sent.
-- **Concurrent streams.** A client MAY hold multiple concurrent `events/stream` requests open, one per subscription. To add a subscription, open an additional stream; to remove one, cancel only its stream. On HTTP/1.1 each stream consumes a TCP connection, so clients with many subscriptions effectively depend on HTTP/2 multiplexing; on stdio, concurrent streams share stdout and are demultiplexed via `requestId`.
+- **Concurrent streams.** A client MAY hold multiple concurrent `events/stream` requests open, one per subscription. To add a subscription, open an additional stream; to remove one, cancel only its stream. On HTTP/1.1 each stream consumes a TCP connection, so clients with many subscriptions effectively depend on HTTP/2 multiplexing; on stdio, concurrent streams share stdout and are demultiplexed via `requestId`. Server SDKs MUST exempt `events/stream` from any general request-concurrency cap, since each push subscription is a long-lived request that never completes until cancelled.
 - **Reconnection after failure.** If the connection drops (HTTP) or the server stops sending (stdio), the client sends a new `events/stream` with the same subscription and its last-known cursor.
 
 #### Cursor Advancement
@@ -299,15 +294,15 @@ sequenceDiagram
     participant Hook as Webhook Endpoint
 
     SDK->>Server: events/subscribe {name, params, delivery: {url, secret}, cursor}
-    Server-->>SDK: {id, refreshBefore}
+    Server-->>SDK: {id, refreshBefore, cursor, truncated}
     loop as events occur
-        Server->>Hook: POST {id, event, cursor} + HMAC signature
+        Server->>Hook: POST {eventId, name, timestamp, data, cursor} + Standard Webhooks signature
         Hook-->>Server: 200 OK
         Hook--)SDK: deliver event (implementation-defined,<br/>e.g. forward proxy → poll/push)
     end
     loop before each refreshBefore
         SDK->>Server: events/subscribe (same key — refreshes TTL)
-        Server-->>SDK: {refreshBefore'}
+        Server-->>SDK: {refreshBefore', cursor, deliveryStatus}
     end
     opt explicit teardown (else: stop refreshing → TTL expiry)
         SDK->>Server: events/unsubscribe {name, params, delivery: {url}}
@@ -332,7 +327,8 @@ Unlike poll and push, webhook delivery requires an explicit subscribe step becau
       "url": "https://proxy.example.com/hooks/client123",
       "secret": "whsec_NWNmOGE3YjJkNGU2ZjgwMTIzNDU2Nzg5YWJjZGVmMDE"
     },
-    "cursor": null
+    "cursor": null,
+    "maxAge": 300
   }
 }
 ```
@@ -340,8 +336,10 @@ Unlike poll and push, webhook delivery requires an explicit subscribe step becau
 ```jsonc
 // Response
 {
-  "id": "sub_a3f1c8e2b0d49f7e",       // server-derived; stable for this (principal?, url, name, params)
-  "refreshBefore": "2026-02-19T16:30:00Z"
+  "id": "sub_a3f1c8e2b0d49f7e",       // server-derived; stable for this (principal, url, name, params)
+  "refreshBefore": "2026-02-19T16:30:00Z",
+  "cursor": "cursor_start_001",       // safe-to-persist watermark (same semantics as payload cursor); advances the client's cursor even if no events arrive before next refresh (see Cursor Lifecycle)
+  "truncated": false                  // true if delivery started later than the supplied cursor (retention window, maxAge floor, or server-side ceiling)
 }
 ```
 
@@ -349,9 +347,10 @@ Unlike poll and push, webhook delivery requires an explicit subscribe step becau
 
 - `events/subscribe` is ONLY used for webhook delivery. Poll and push do not need it.
 - `delivery.secret` is REQUIRED. The client supplies the HMAC signing secret; the server never generates one. The value MUST be a Standard Webhooks symmetric secret: the literal prefix `whsec_` followed by base64 of 24–64 random bytes. Servers MUST reject values that do not satisfy this with `InvalidParams`. Client SDKs SHOULD generate the secret on the application's behalf rather than expose an interface that encourages hand-picked values.
-- `id` (response only) is a server-derived handle for the subscription, deterministic over `(principal?, delivery.url, name, params)`. The server returns it so the receiver can route deliveries (it appears in the `X-MCP-Subscription-Id` header on every POST). It is stable across refreshes and server restarts. The client does not generate or send it.
-- `cursor` (request only) tells the server where to begin delivery. `null` means "start from now." A non-null value requests replay from that position (honoured when the event type is backed by a durable upstream). The cursor is **client-owned**: the server does not persist a cursor position (the response does not include one), though it computes a safe-to-persist watermark for inclusion in each delivered payload (see *Webhook Event Delivery*). The client persists that `cursor` and supplies it on every refresh. If the subscription is live, the supplied cursor is at or behind the server's in-flight position and the server treats it as a no-op (delivery continues uninterrupted). If the subscription has lapsed or the server has restarted, the cursor becomes the replay point. This means clients use a single rule — always pass the last-persisted cursor — and the server is idempotent under it.
+- `id` (response only) is a server-derived handle for the subscription, deterministic over `(principal, delivery.url, name, params)`. The server returns it so the receiver can route deliveries (it appears in the `X-MCP-Subscription-Id` header on every POST). It is stable across refreshes and server restarts. The client does not generate or send it.
+- `cursor` (request) tells the server where to begin delivery. `null` means "start from now." A non-null value requests replay from that position (honoured when the event type is backed by a durable upstream). The cursor is **client-owned**: the server does not persist a per-subscription cursor position across restarts; it computes a safe-to-persist watermark for inclusion in each delivered payload (see *Webhook Event Delivery*) and returns that same watermark in each subscribe/refresh response so the client's cursor advances during quiet periods. Both sources carry the same value semantics, so the client persists whichever it receives most recently and supplies it on every refresh. If the subscription is live, the supplied cursor is at or behind the server's in-flight position and the server treats it as a no-op (delivery continues uninterrupted). If the subscription has lapsed or the server has restarted, the cursor becomes the replay point. This means clients use a single rule — always pass the last-persisted cursor — and the server is idempotent under it.
 - `refreshBefore` is mandatory. It is an ISO 8601 timestamp indicating when the subscription will expire. The client MUST re-call `events/subscribe` with the same subscription key before this time to keep the subscription alive. The server resets the TTL on each refresh.
+- `cursor` (response) is the same **safe-to-persist watermark** the server includes in delivery payloads — i.e., a position at or before which everything has been acknowledged or abandoned. Returning it here lets the client's cursor advance during quiet periods when no event POSTs arrive; without this, a long quiet stretch could leave the client holding a cursor older than the upstream's retention window. When deliveries are in flight, the response cursor is at or behind the upstream head (it does not advance past unacked events), so persisting it never skips anything. It is `null` for event types that do not support replay.
 - `events/subscribe` is idempotent within the caller's subscription scope (see *Subscription Identity*). If a subscription with the same scoped key exists, the server resets the TTL and updates mutable fields in place. If the subscription has expired — or the server has restarted and lost it — the server creates a fresh subscription using the provided cursor.
 - The server holds subscription state (event name, params, callback URL, secret, derived id) in memory with TTL. No durable storage is required — if the server restarts, clients will re-subscribe on their next refresh cycle. For event types backed by a durable upstream, the client's persisted cursor recovers any events that occurred during the gap; for emit-only event types, events during the gap are not recoverable (see *Emit-only event types*).
 
@@ -359,7 +358,9 @@ Unlike poll and push, webhook delivery requires an explicit subscribe step becau
 
 Webhook subscriptions are keyed by a compound **subscription key** that determines which `events/subscribe` calls refer to the same logical subscription. The server uses this key for idempotent upsert on subscribe, for lookup on unsubscribe, and to isolate tenants from one another.
 
-**Key composition.** The subscription key is `(principal?, delivery.url, name, params)`, where `principal` is the server's canonical identifier for the authenticated subject (e.g., OAuth `sub`, API key ID, service-account name) and is included when present. `params` is compared by canonical-JSON equality. There is no client-generated `id` — a subscription is fully determined by what it listens for, where it delivers, and (when authenticated) who asked.
+**Authentication required.** `events/subscribe` and `events/unsubscribe` MUST be called with an authenticated principal; servers MUST reject unauthenticated calls with `-32012 Unauthorized`. Without a principal in the key, the tuple `(delivery.url, name, params)` is guessable and any caller could unsubscribe or rotate another tenant's secret. Unauthenticated MCP servers may offer poll and push, but not webhook.
+
+**Key composition.** The subscription key is `(principal, delivery.url, name, params)`, where `principal` is the server's canonical identifier for the authenticated subject (e.g., OAuth `sub`, API key ID, service-account name). `params` is compared by canonical-JSON equality. There is no client-generated `id` — a subscription is fully determined by what it listens for, where it delivers, and who asked.
 
 All four components are immutable for the subscription's lifetime: a subscribe call with a different value for any of them addresses a different subscription. To change what a subscription listens for or where it delivers, `events/unsubscribe` the old one and `events/subscribe` a new one. This avoids the case where `name`/`params` change in place but the upstream listener provisioned by `on_subscribe` remains bound to the old values.
 
@@ -374,7 +375,7 @@ On an idempotent subscribe against an existing key, the server updates the remai
 | TTL | Reset. |
 | `active` | Set to `true`. A successful refresh is the client's liveness signal; if delivery had been suspended (`active: false` in `deliveryStatus`) due to repeated failures, the server resumes retrying pending events. |
 
-**Cross-tenant isolation.** Because the key includes `delivery.url` (and `principal` when authenticated), two distinct tenants subscribing to the same `(name, params)` get distinct subscriptions. A caller who learns another tenant's derived `id` gains nothing — `id` is not accepted as input to any method.
+**Cross-tenant isolation.** Because the key includes `principal` and `delivery.url`, two distinct tenants subscribing to the same `(name, params)` get distinct subscriptions. A caller who learns another tenant's derived `id` gains nothing — `id` is not accepted as input to any method.
 
 #### Webhook Event Delivery
 
@@ -389,7 +390,6 @@ webhook-signature: v1,<base64 HMAC-SHA256(secret, "evt_789.1739980800." + body)>
 X-MCP-Subscription-Id: sub_a3f1c8e2b0d49f7e
 
 {
-  "id": "sub_a3f1c8e2b0d49f7e",
   "eventId": "evt_789",
   "name": "incident.created",
   "timestamp": "2026-02-19T16:00:00Z",
@@ -404,13 +404,23 @@ X-MCP-Subscription-Id: sub_a3f1c8e2b0d49f7e
 
 **Notes:**
 
-- Deliveries follow the [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md) signature scheme. `webhook-id` carries the `eventId` (per-delivery, used for dedup). `webhook-timestamp` is the Unix timestamp (seconds) of the request. `webhook-signature` is `v1,<base64>` where the value is `HMAC-SHA256(secret, webhook-id + "." + webhook-timestamp + "." + body)`; multiple space-delimited signatures MAY be present during secret rotation. `X-MCP-Subscription-Id` is an MCP-specific header (not part of Standard Webhooks) carrying the subscription `id` so the receiver can select the correct secret before parsing the body. The receiver MUST verify the signature before processing, SHOULD reject deliveries where `webhook-timestamp` is more than 5 minutes old, and SHOULD deduplicate on `webhook-id`. Each retry attempt regenerates the timestamp and signature.
+- Deliveries follow the [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md) signature scheme. `webhook-id` carries the `eventId` for event deliveries (per-delivery, used for dedup; control envelopes use `msg_<type>_<random>` — see *Non-event webhook bodies*). `webhook-timestamp` is the Unix timestamp (seconds) of the request. `webhook-signature` is `v1,<base64>` where the value is `HMAC-SHA256(secret, webhook-id + "." + webhook-timestamp + "." + body)`; multiple space-delimited signatures MAY be present during secret rotation. `X-MCP-Subscription-Id` is an MCP-specific header (not part of Standard Webhooks) carrying the subscription `id` so the receiver can select the correct secret before parsing the body. The receiver MUST verify the signature before processing, SHOULD reject deliveries where `webhook-timestamp` is more than 5 minutes old, and SHOULD deduplicate on `webhook-id`. Each retry attempt regenerates the timestamp and signature.
 - `eventId` in the body enables idempotent processing. The receiver SHOULD deduplicate by this value.
-- `cursor` in the body is a **safe-to-persist watermark**: it represents a position such that every event at or before it has been acknowledged by the endpoint or abandoned by the server. The server computes this from its in-memory retry queue — it does not include `cursor_N` in event N's payload until events at positions `< N` have been acked or given up on. The client persists every cursor it receives; the most recently received value is always safe to supply on refresh. The server MAY send `cursor: null` for event types that do not support replay (see *Cursor Lifecycle*); in that case there is no recovery point to persist. The endpoint MUST make `cursor` and `eventId` available to the consuming client by whatever channel it uses to forward events; cursor-based recovery on resubscribe depends on the client receiving and persisting this value.
+- `cursor` in the body is a **safe-to-persist watermark**: it represents a position such that every event at or before it has been acknowledged by the endpoint or abandoned by the server. The server computes this from its in-memory retry queue — it does not include `cursor_N` in event N's payload until events at positions `< N` have been acked or given up on. Computing this requires the server to hold, per active subscription, the upstream position and ack status of in-flight events; this is in-memory TTL-scoped state (lost on restart, reconstructed by client refresh), but it is per-subscription bookkeeping the SDK must implement. The client persists every cursor it receives; the most recently received value is always safe to supply on refresh. The server MAY send `cursor: null` for event types that do not support replay (see *Cursor Lifecycle*); in that case there is no recovery point to persist. The endpoint MUST make `cursor` and `eventId` available to the consuming client by whatever channel it uses to forward events; cursor-based recovery on resubscribe depends on the client receiving and persisting this value.
 - **Delivery model.** The server retries each event independently with exponential backoff on non-`2xx` responses. This matches the dominant webhook convention (Stripe, GitHub, Shopify, the Standard Webhooks spec). Concurrent deliveries and retries may therefore arrive out of order; the receiver uses `eventId` for deduplication and `timestamp` for ordering if needed. Because the payload `cursor` is a watermark (not the event's own position), out-of-order arrival does not cause the client to persist an unsafe cursor.
 - **Acknowledgement semantics.** A `2xx` response from the webhook endpoint signals that the event has been accepted and the server need not retry it. The endpoint SHOULD NOT return `2xx` until the event has been durably persisted or forwarded — an endpoint that ACKs and then loses the event leaves recovery dependent on the client's last-persisted cursor, which may predate the lost event. At-least-once delivery in webhook mode holds between server and endpoint; end-to-end delivery to the agent depends on the endpoint honouring this contract.
 - **Subscribe/delivery race.** Because the secret is client-supplied, the receiver can verify the very first delivery — there is no window where a delivery arrives before the receiver knows the secret. A receiver that gets a delivery for an `id` it has not yet been told to route (e.g., the subscribe response has not propagated to the gateway) SHOULD return a retryable status (`503` or `425 Too Early`); the server's retry/backoff redelivers once the receiver is ready. `eventId` deduplication and cursor replay make this safe.
 - After repeated failures (server-defined threshold), the server MAY suspend delivery (`deliveryStatus.active: false`). A subsequent successful refresh reactivates it (sets `active: true`) and the server resumes retrying pending events; if the client never refreshes, the subscription expires naturally at TTL.
+
+#### Non-event webhook bodies
+
+In addition to `EventOccurrence` bodies, the server POSTs control envelopes to the callback URL. A body with a top-level `type` field is a control envelope; a body without one is an `EventOccurrence`. These are signed and headed exactly like event deliveries (Standard Webhooks headers + `X-MCP-Subscription-Id`); the body carries a `type` discriminator instead of `eventId`/`data`. `webhook-id` for control envelopes is a per-message identifier of the form `msg_<type>_<random>` so receivers can dedup retries. The endpoint MUST forward control envelopes to the consuming client by the same channel it forwards events.
+
+| `type` | Body | Sent when |
+|---|---|---|
+| `gap` | `{"type":"gap","cursor":"<fresh>"}` | A gap is detected between refreshes (see *Gaps and `truncated`*). The client persists `cursor` and treats it as `truncated: true`. |
+| `terminated` | `{"type":"terminated","error":{"code":...,"message":...,"data":...}}` | The subscription has ended (e.g., authorization revoked). The subscription no longer exists server-side. |
+| `verification` | `{"type":"verification","challenge":"<nonce>"}` | *(Pending — see Open Question 6.)* |
 
 #### Webhook Delivery Status
 
@@ -421,6 +431,8 @@ The `events/subscribe` response MAY include a `deliveryStatus` object when refre
 {
   "id": "sub_a3f1c8e2b0d49f7e",
   "refreshBefore": "2026-02-19T17:00:00Z",
+  "cursor": "cursor_xyz",
+  "truncated": false,
   "deliveryStatus": {
     "active": true,
     "lastDeliveryAt": "2026-02-19T16:28:00Z",
@@ -434,6 +446,8 @@ The `events/subscribe` response MAY include a `deliveryStatus` object when refre
 {
   "id": "sub_a3f1c8e2b0d49f7e",
   "refreshBefore": "2026-02-19T17:00:00Z",
+  "cursor": "cursor_xyz",
+  "truncated": false,
   "deliveryStatus": {
     "active": false,
     "lastDeliveryAt": "2026-02-19T15:45:00Z",
@@ -449,24 +463,11 @@ The `events/subscribe` response MAY include a `deliveryStatus` object when refre
 
 **SSRF prevention.** The server MUST validate callback URLs. Servers SHOULD reject URLs whose resolved IP is not globally routable per the [IANA IPv4](https://www.iana.org/assignments/iana-ipv4-special-registry/) and [IPv6](https://www.iana.org/assignments/iana-ipv6-special-registry/) Special-Purpose Address Registries (illustrative examples: `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `::1`, `fc00::/7`, `fe80::/10`) unless explicitly configured to allow them. To prevent DNS rebinding, this validation MUST be performed at delivery time, not only at subscribe time: the server resolves the hostname, checks the resolved IP against the blocklist, and connects directly to that validated IP (sending the original hostname in the `Host` header / TLS SNI) so the address cannot change between check and connect. Subscribe-time validation alone is insufficient — a rebinding attacker returns a public IP at subscribe time and a private IP at delivery time. Webhook delivery requests MUST NOT follow HTTP redirects, since a redirect can target an internal address that bypasses the blocklist. Servers MAY additionally maintain an allowlist of permitted callback URL patterns.
 
-**Endpoint verification.** Before activating delivery for a newly created subscription, the server MUST verify that the subscriber controls `delivery.url`. The server POSTs a verification request to the URL:
-
-```
-POST https://proxy.example.com/hooks/client123
-Content-Type: application/json
-webhook-id: msg_verify_9f86d081
-webhook-timestamp: 1739980800
-webhook-signature: v1,<...>
-X-MCP-Subscription-Id: sub_a3f1c8e2b0d49f7e
-
-{"type":"verification","id":"sub_a3f1c8e2b0d49f7e","challenge":"9f86d081884c7d65"}
-```
-
-The endpoint MUST respond `200 OK` with body `{"challenge":"9f86d081884c7d65"}` (echoing the token exactly). The server MUST NOT begin delivering events until verification succeeds, and SHOULD fail the `events/subscribe` call with `-32015 InvalidCallbackUrl` if verification does not succeed within a short timeout. Verification is required only on creation, not on refresh of an existing subscription. This prevents a caller from directing the server to POST (and retry) events at an arbitrary third-party endpoint they do not control — without it, the server is a confused-deputy amplification vector.
+**Endpoint verification.** *(Open — see Open Question 6.)* Whether the server performs an ownership challenge before activating delivery, what that challenge carries, and whether it is MUST or SHOULD given client-supplied HMAC, are not yet settled. The interaction with optional asymmetric server signing (sender identity for gateway allowlists) is part of the same decision.
 
 **TLS requirement.** Callback URLs MUST use `https://`. Servers MUST reject `events/subscribe` with a non-`https` `delivery.url` (`-32015 InvalidCallbackUrl`). Event payloads and the `delivery.secret` (sent in the subscribe request) would otherwise transit in cleartext.
 
-**Signature scheme (Standard Webhooks profile).** MCP webhook delivery is a profile of [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md). Every delivery MUST include `webhook-id` (the `eventId`), `webhook-timestamp` (Unix seconds), and `webhook-signature`. The signature is `HMAC-SHA256(secret, webhook-id + "." + webhook-timestamp + "." + body)` encoded as base64 with a `v1,` prefix. In this formula, `body` is the raw HTTP request body bytes exactly as received, before any parsing or re-serialization; the `webhook-id + "." + webhook-timestamp + "."` prefix is UTF-8; and `secret` is the base64-decoded bytes of the value after the `whsec_` prefix. Receivers MUST compute the HMAC over the raw body, never over a re-serialized JSON object. The header MAY contain multiple space-delimited signatures (`v1,<sigA> v1,<sigB>`) during secret rotation; the receiver accepts if any verifies. Each retry attempt MUST regenerate the timestamp and signature so retries are not rejected by the receiver's freshness window. The receiver SHOULD reject deliveries where `webhook-timestamp` is more than 5 minutes old. Off-the-shelf Standard Webhooks verifiers (e.g., Svix libraries) work without modification.
+**Signature scheme (Standard Webhooks profile).** MCP webhook delivery is a profile of [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md). Every delivery MUST include `webhook-id` (the `eventId` for event deliveries; `msg_<type>_<random>` for control envelopes), `webhook-timestamp` (Unix seconds), and `webhook-signature`. The signature is `HMAC-SHA256(secret, webhook-id + "." + webhook-timestamp + "." + body)` encoded as base64 with a `v1,` prefix. In this formula, `body` is the raw HTTP request body bytes exactly as received, before any parsing or re-serialization; the `webhook-id + "." + webhook-timestamp + "."` prefix is UTF-8; and `secret` is the base64-decoded bytes of the value after the `whsec_` prefix. Receivers MUST compute the HMAC over the raw body, never over a re-serialized JSON object. The header MAY contain multiple space-delimited signatures (`v1,<sigA> v1,<sigB>`) during secret rotation; the receiver accepts if any verifies. Each retry attempt MUST regenerate the timestamp and signature so retries are not rejected by the receiver's freshness window. The receiver SHOULD reject deliveries where `webhook-timestamp` is more than 5 minutes old. Off-the-shelf Standard Webhooks verifiers (e.g., Svix libraries) work without modification.
 
 In addition to the Standard Webhooks headers, deliveries MUST include `X-MCP-Subscription-Id` (the subscription `id`) so the receiver can select the correct secret without parsing the body. This is the only MCP-specific header; everything else conforms to Standard Webhooks.
 
@@ -505,9 +506,9 @@ HMAC is verified by application code after the request has been routed. It does 
 }
 ```
 
-`events/unsubscribe` resolves the subscription using the same key as `events/subscribe` — `(principal?, delivery.url, name, params)`. The client supplies `name`, `params`, and `delivery.url`; `principal` comes from the auth layer when present. The derived `id` is not accepted as input.
+`events/unsubscribe` resolves the subscription using the same key as `events/subscribe` — `(principal, delivery.url, name, params)`. The client supplies `name`, `params`, and `delivery.url`; `principal` comes from the auth layer. The derived `id` is not accepted as input.
 
-`events/unsubscribe` is ONLY used for webhook delivery. Poll subscriptions are implicit (stop polling to unsubscribe). Push subscriptions are scoped to the `events/stream` connection (close to unsubscribe).
+`events/unsubscribe` is ONLY used for webhook delivery. Poll subscriptions are implicit (stop polling to unsubscribe). Push subscriptions are scoped to the `events/stream` request (close or cancel to unsubscribe).
 
 ## Listing Active Subscriptions
 
@@ -521,35 +522,21 @@ Cursors are opaque strings managed by the server. They represent a position in t
 
 **Replay is optional per event type.** A server MAY return `cursor: null` in any delivery (poll result, push `notifications/events/event` and `notifications/events/active`, webhook payload) when the event type does not support replay — typically because the upstream is push-only with no addressable history. A client receiving `cursor: null` MUST NOT attempt to persist or replay from it; on reconnect/resubscribe it sends `cursor: null` (start from now) and accepts that events during the gap are not recoverable. Servers SHOULD be consistent: an event type that ever returns a non-null cursor SHOULD always do so, and one that returns `null` SHOULD always return `null`, so clients can branch once at subscribe time rather than per delivery.
 
-**Initial cursor:** Passing `cursor: null` in a subscription (either in `events/poll` or `events/stream`) means "start from now." The server returns a fresh cursor representing the current position (or `null` if the event type does not support replay). No historical events are replayed.
+**Initial cursor:** Passing `cursor: null` in any mode means "start from now." The server returns a fresh cursor representing the current position (or `null` if the event type does not support replay). No historical events are replayed.
 
-**Cursor expiry:** Cursors may become invalid (upstream data compacted, server state reset). The server returns a `CursorExpired` error for the affected subscription. `CursorExpired` always implies a possible gap — events between the supplied cursor and the new "now" may be unrecoverable — and the server generally cannot determine otherwise. Clients SHOULD treat it as a gap (e.g., re-fetch authoritative state via tools if it matters) and re-subscribe with `cursor: null`.
+**Cursor advancement without events.** The client's persisted cursor must advance during quiet periods so it doesn't fall outside the upstream's retention window when nothing is happening. Poll covers this inherently (every response carries `cursor`, including when `events: []`). For push, the heartbeat carries `cursor` (see *Heartbeat* under Push-Based Delivery). For webhook, each `events/subscribe` refresh response carries `cursor`. In all three the value is safe to persist (for webhook it is the same watermark as in delivery payloads, never ahead of unacked events); the client persists it exactly as it would a cursor from a delivered event.
 
-For poll mode, this is a standard JSON-RPC error response to the `events/poll` request:
+**Bounding replay with `maxAge`.** All three modes accept an optional `maxAge` (integer seconds) alongside `cursor`. When present, the server begins replay from whichever is *later*: the supplied `cursor`, or `now − maxAge`. This lets a client resubscribe with a stale cursor without receiving an unbounded backlog — e.g., a host that was offline for a week can pass its persisted cursor with `maxAge: 300` to get at most the last five minutes. If the floor advances past the cursor, the server SHOULD set `truncated: true` on the first response (poll result / `notifications/events/active` / webhook subscribe response) so the client knows older events were skipped. Servers whose upstream supports time-addressed reads (e.g., Gmail `after:`, Slack `oldest=`, Kafka `offsetsForTimes`) SHOULD seek directly; others MAY honour `maxAge` by replaying from `cursor` and discarding events whose `timestamp` is older than the floor — or, if that would be prohibitively expensive (e.g., a week-old cursor with `maxAge: 300`), MAY instead reset to now and return `truncated: true`, which yields the same client-visible outcome without the wasted scan. Servers MAY also apply their own replay ceiling independent of `maxAge` and MUST signal it via `truncated: true` when they do. `maxAge` is ignored when `cursor` is `null` (null already means "now"; replay from before the subscription's start is out of scope per *What Is NOT in v1*) and for event types that do not support replay.
 
-```jsonc
-{"jsonrpc":"2.0","id":7,"error":{"code":-32014,"message":"CursorExpired","data":{"reason":"Upstream history compacted"}}}
-```
+**Gaps and `truncated`.** `truncated: true` is the single signal that the server started delivery from a position later than the cursor the client supplied — i.e., events were skipped. Causes are not distinguished on the wire: the supplied cursor may have fallen outside the upstream's retention window, the `maxAge` floor may have advanced past it, or the server may have applied its own replay ceiling. In all cases the server resets to a position it can serve from, returns that position as the fresh `cursor` alongside `truncated: true`, and continues — the client never reconnects or re-subscribes in response. `truncated: true` always implies a possible gap; clients SHOULD treat it as such (e.g., re-fetch authoritative state via tools if it matters) and persist the fresh cursor.
 
-For push mode, this appears as a notification on the stream:
+| Mode | Where `truncated` appears |
+|---|---|
+| Poll | The result body: `{events:[], cursor:<fresh>, truncated:true, hasMore, nextPollSeconds}`. Never a JSON-RPC error. |
+| Push | A `notifications/events/active {requestId, cursor:<fresh>, truncated:true}` is sent (initially, and again mid-stream if a gap occurs); delivery continues on the same stream. |
+| Webhook | The subscribe/refresh response: `{id, refreshBefore, cursor:<fresh>, truncated:true, ...}`. For a gap detected between refreshes, the server POSTs a `{"type":"gap","cursor":"<fresh>"}` control envelope (see *Non-event webhook bodies*) so the client learns of it without waiting for the next refresh. |
 
-```
-data: {"jsonrpc":"2.0","method":"notifications/events/error","params":{"requestId":1,"id":"sub_email","error":{"code":-32014,"message":"CursorExpired","data":{"reason":"Upstream history compacted"}}}}
-```
-
-For webhook mode, the server POSTs an error envelope to the callback URL (signed like a normal delivery), and additionally surfaces it in `deliveryStatus.lastError` on the next refresh:
-
-```
-POST https://proxy.example.com/hooks/client123
-webhook-id: msg_err_a1b2c3d4
-webhook-timestamp: 1739980800
-webhook-signature: v1,<...>
-X-MCP-Subscription-Id: sub_a3f1c8e2b0d49f7e
-
-{"id":"sub_a3f1c8e2b0d49f7e","error":{"code":-32014,"message":"CursorExpired","data":{"reason":"Upstream history compacted"}}}
-```
-
-On `CursorExpired`, the client should reconnect the affected subscription with `cursor: null`.
+For event types that do not support replay (`cursor` is always `null`), `truncated` SHOULD be `false` and clients SHOULD ignore it — there is no position to have advanced past.
 
 ## Server SDK Guidance
 
@@ -561,7 +548,7 @@ By default the server author does not declare which delivery modes an event type
 - **Push** is available when the transport supports streaming (Streamable HTTP or stdio).
 - **Webhook** is available when the server has `webhook_ttl` configured.
 
-The SDK computes the `delivery` array in `events/list` responses from the above (always including `poll`), minus any push/webhook modes the author has explicitly disabled. Servers that call `server.emit()` for an event type additionally enable real-time push and webhook delivery without the SDK needing to run an internal polling loop.
+The SDK computes the `delivery` array in `events/list` responses from the above, minus any modes the author has explicitly disabled. Servers that call `server.emit()` for an event type additionally enable real-time push and webhook delivery without the SDK needing to run an internal polling loop.
 
 ```python
 @server.event(
@@ -664,7 +651,7 @@ async def on_pagerduty_webhook(payload):
     server.emit(Event(name="incident.created", data={...}))
 ```
 
-SDKs SHOULD provide an in-memory ring buffer that retains a bounded window of emitted events per event type (configurable by time and/or count). `events/poll` for an emit-only event type reads from this buffer. The cursor is a buffer-local sequence number; it is process-scoped — a server restart invalidates all cursors and clients receive `CursorExpired`, resetting to "now." Events emitted during server downtime are not recoverable. This matches the upstream's own guarantees for push-only sources and keeps the server author's implementation to a single `emit()` call per upstream event.
+SDKs SHOULD provide an in-memory ring buffer that retains a bounded window of emitted events per event type (configurable by time and/or count). `events/poll` for an emit-only event type reads from this buffer. The cursor is a buffer-local sequence number; it is process-scoped — a server restart invalidates all cursors and clients receive `truncated: true` with a fresh cursor. Events emitted during server downtime are not recoverable. This matches the upstream's own guarantees for push-only sources and keeps the server author's implementation to a single `emit()` call per upstream event.
 
 ```python
 server = MCPServer(
@@ -693,7 +680,7 @@ async def on_unsubscribe(context, params, subscription_id):
 
 These hooks are called by the SDK across all delivery modes. The server author writes the upstream setup/teardown logic once; the SDK handles the delivery mechanics. Servers SHOULD enforce `TooManySubscriptions` before invoking `on_subscribe`, so a rejected subscription never provisions upstream resources.
 
-**Unsubscribe timing by mode.** Push and webhook have explicit end-of-life signals — push fires `on_unsubscribe` when the stream closes, webhook when `events/unsubscribe` is called or the TTL lapses. Poll does not: the client simply stops calling `events/poll`, and the server never sees a goodbye. To prevent poll-provisioned upstream resources from leaking, the SDK treats poll subscriptions as leased. The lease is keyed on `(principal, eventName, canonicalHash(params))` — the request `id` is not used, since it is request-scoped and opaque. `on_subscribe` fires the first time a given key appears in a poll request; each subsequent poll for that key renews the lease; `on_unsubscribe` fires when the lease expires without renewal. This lease table is ephemeral SDK state, not protocol state: it is never persisted, and a server restart simply re-fires `on_subscribe` on the next poll. The lease window is SDK-configurable and SHOULD default to a small multiple of the server's typical `nextPollSeconds` so that a well-behaved client never lapses between polls:
+**Unsubscribe timing by mode.** Push and webhook have explicit end-of-life signals — push fires `on_unsubscribe` when the stream closes, webhook when `events/unsubscribe` is called or the TTL lapses. Poll does not: the client simply stops calling `events/poll`, and the server never sees a goodbye. To prevent poll-provisioned upstream resources from leaking, the SDK treats poll subscriptions as leased. The lease is keyed on `(principal-or-null, eventName, canonicalHash(params))` — on unauthenticated servers all callers share one lease per `(name, params)`. `on_subscribe` fires the first time a given key appears in a poll request; each subsequent poll for that key renews the lease; `on_unsubscribe` fires when the lease expires without renewal. This lease table is ephemeral SDK state, not protocol state: it is never persisted, and a server restart simply re-fires `on_subscribe` on the next poll. The lease window is SDK-configurable and SHOULD default to a small multiple of the server's typical `nextPollSeconds` so that a well-behaved client never lapses between polls:
 
 ```python
 server = MCPServer(
@@ -732,7 +719,7 @@ async for event in sub:
 await sub.cancel()
 ```
 
-The SDK manages delivery mode selection, poll loops, push stream lifecycle, webhook refresh cycles, cursor tracking, deduplication by `eventId`, cursor expiry recovery, and reconnection — all transparently.
+The SDK manages delivery mode selection, poll loops, push stream lifecycle, webhook refresh cycles, cursor tracking, deduplication by `eventId`, gap/`truncated` handling, and reconnection — all transparently.
 
 ### Delivery Mode Selection
 
@@ -787,7 +774,7 @@ This reduces PII exposure in event infrastructure (logs, queues, buffers) and li
 
 ### Authorization
 
-**Subscribe-time:** The server MUST verify that the authenticated user has permission to subscribe to the requested event type with the given params. For example, a Slack server must verify the user has access to the channel specified in the params.
+**Subscribe-time:** When the caller is authenticated, the server MUST verify the principal has permission to subscribe to the requested event type with the given params (e.g., a Slack server verifies the user has access to the specified channel). Unauthenticated servers — which may offer poll and push but not webhook — apply whatever server-side policy they choose, including accepting all subscriptions.
 
 **Delivery-time:** The server SHOULD periodically re-verify permissions. If the user's access is revoked (e.g., removed from a Slack channel), the server terminates the subscription. The termination signal carries the same nested-`error` shape across all modes:
 
@@ -795,17 +782,17 @@ This reduces PII exposure in event infrastructure (logs, queues, buffers) and li
 |---|---|
 | Push | `notifications/events/terminated` on the SSE stream |
 | Poll | JSON-RPC error response to the next `events/poll` request |
-| Webhook | Signed error envelope POSTed to the callback URL, plus `deliveryStatus.lastError` on next refresh |
+| Webhook | Signed `{"type":"terminated",...}` envelope POSTed to the callback URL (see *Non-event webhook bodies*); the subscription no longer exists, so a subsequent refresh is a fresh subscribe and returns `-32012 Unauthorized` if the cause of termination still applies |
 
 ```
 // Push
-data: {"jsonrpc":"2.0","method":"notifications/events/terminated","params":{"requestId":1,"id":"sub_slack","error":{"code":-32012,"message":"Unauthorized","data":{"reason":"Access revoked"}}}}
+data: {"jsonrpc":"2.0","method":"notifications/events/terminated","params":{"requestId":1,"error":{"code":-32012,"message":"Unauthorized","data":{"reason":"Access revoked"}}}}
 
 // Webhook (POST body)
-{"id":"sub_slack","error":{"code":-32012,"message":"Unauthorized","data":{"reason":"Access revoked"}}}
+{"type":"terminated","error":{"code":-32012,"message":"Unauthorized","data":{"reason":"Access revoked"}}}
 ```
 
-`notifications/events/terminated` has the shape `{requestId: string|integer, id: string, error: {code: integer, message: string, data?: object}}` — identical to `notifications/events/error` but indicates the subscription has ended, not just a per-event failure. The client SDK SHOULD remove the subscription and notify the application.
+`notifications/events/terminated` has the shape `{requestId: string|integer, error: {code: integer, message: string, data?: object}}` — identical to `notifications/events/error` but indicates the subscription has ended, not just a per-event failure. The client SDK SHOULD remove the subscription and notify the application.
 
 **Action-time:** Event receipt does NOT constitute authorization to act. The agent's response to an event (e.g., calling a tool) goes through normal MCP authorization. The spec should be explicit about this.
 
@@ -847,7 +834,12 @@ The spec does not mandate specific governance mechanisms but is designed to enab
 
 4. **Can a single subscription span multiple event names with one cursor?** *(wire-breaking if adopted)* Several upstreams expose one ordered change feed that yields multiple event types — a Kubernetes watch on a namespace produces pod, deployment, and event objects; a Kafka consumer on one topic yields heterogeneous message kinds; a Slack Socket Mode connection delivers messages and reactions. Under the current model, a client wanting both `k8s.pod_phase_changed` and `k8s.oom_killed` opens two subscriptions with two cursors, and the server runs two parallel watches against the same apiserver. Options: (a) keep per-event-name subscriptions and let the server SDK internally coalesce upstream connections (no protocol change, SDK complexity); (b) allow a subscription's `name` to be an array so one cursor covers a set of event types (protocol change, simpler server, client must demux); (c) introduce an event-group concept at registration time. The TypeScript SDK stress-test hit this with both Slack and Kubernetes.
 
-> **Resolved (was: should webhook delivery adopt Standard Webhooks?)** — adopted as a profile; see *Signature scheme (Standard Webhooks profile)* under Webhook Security. This also resolves the multi-signature rotation question via Standard Webhooks' space-delimited `v1,<sigA> v1,<sigB>` format.
+5. **Should MCP task state changes be exposed as events?** Tasks are MCP's long-running-operation primitive; clients currently learn of state transitions via push notifications on a live connection. Exposing a reserved `mcp.task.updated` event type (params `{taskId}`, payload `{status, progress?, result?}`) would let a client that started a task and disconnected receive the completion via poll or webhook — useful for "kick off a long job, close the laptop, get notified when done." Same considerations as question 2: reserved `mcp.*` prefix, migration path, and whether one mechanism subsuming another is worth the coupling.
+
+6. **Endpoint verification and server-identity signing — what is required, and how do they relate?** Two intertwined sub-questions:
+   - *Ownership challenge.* With client-supplied HMAC secrets, a delivery to an endpoint that didn't originate the secret already fails verification, so a nonce-echo challenge is arguably defence-in-depth (fail-fast on bad URLs; bound spam to one POST) rather than the load-bearing control. Options: MUST (prior text), SHOULD, or omit. If kept, the challenge is an HMAC-signed `{"type":"verification","id":...,"challenge":...}` POST; the endpoint echoes the token.
+   - *Asymmetric server signing.* Servers MAY additionally sign deliveries with an ed25519 key (Standard Webhooks `v1a,`), with the public key published via JWKS at the server's origin (potentially via SEP-2127 server cards). This lets a gateway verify *which server* sent a delivery and enforce a server allowlist, and provides defence-in-depth if an HMAC secret leaks. Key distribution must be anchored to an origin the gateway already trusts — a key or JWKS URL carried in the challenge itself is trust-on-first-use and can be attacker-supplied.
+   These need to be resolved together: the answer to "is the challenge MUST" depends on whether asymmetric signing is expected to be common, and both depend on what threat the gateway is defending against (third-party-target abuse vs server impersonation vs leaked secret).
 
 ## Note on Consistency and Ordering
 
@@ -881,6 +873,27 @@ Head-of-line blocking — where a slow-to-process event delays delivery of subse
 
 One known gap is **push-mode reconnect replay**: a client reconnecting with a stale cursor may receive a large backlog burst on the stream, with no protocol-level bound equivalent to poll's `maxEvents`/`hasMore`. For v1 this is left to TCP backpressure and server-side pacing. If future use cases involve high-throughput event streams where producer-side backpressure or bounded replay becomes necessary, a credit-based flow control extension can be added without breaking the existing protocol.
 
+## Key Design Decisions
+
+These are the choices where reasonable alternatives existed; recorded so reviewers can challenge the trade-off rather than re-derive the option space.
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Mandatory delivery mode | None — servers advertise any non-empty subset of poll/push/webhook | Universal compatibility would be nice, but mandating any single mode places an unacceptable burden on implementers (poll needs a history or buffer; push needs a held connection; webhook needs outbound HTTP + SSRF hardening). The extension is already opt-in. May revisit if deployments converge on a common subset in practice. |
+| Webhook signature scheme | Adopt Standard Webhooks as a profile (`webhook-id`/`-timestamp`/`-signature`, `v1,` HMAC, `whsec_` secrets, multi-sig rotation) | Gets off-the-shelf verifier libraries in most languages and a defined asymmetric (`v1a,`) path for free. Trade-off is a dependency on an external community spec, but it's small, stable, pinnable, and not a one-way door. |
+| Batched poll/stream | One subscription per `events/poll`/`events/stream` request | Batching is a transport-level concern; HTTP/2 multiplexing makes per-subscription requests cheap. Avoids the protocol complexity batching introduces (coalescing heterogeneous `nextPollSeconds`, partial-failure result shapes, per-entry error routing, duplicate-id handling). Clients with many subscriptions on HTTP/1.1 should expect to coalesce at the transport, not the protocol. |
+| Webhook secret generation | Client-supplied, REQUIRED, per subscription (`whsec_` + 24–64 B) | Avoids the post-subscribe write-back race of server-generated per-sub secrets and the out-of-band registration step of per-endpoint secrets. Crucially, HMAC then proves "this delivery is for a subscription *this endpoint* originated," not merely "this came from the server" — closing third-party-target abuse without a mandatory challenge. |
+| Multimedia / high-throughput streams | Out of scope | Streaming media has fundamentally different transport, framing, and back-pressure requirements. Designing for human/automation-scale event rates keeps the SDK surface tractable; a media primitive would be a separate proposal. |
+| Reliable / ordered delivery | Supported (via opaque cursors + `eventId` dedup), not mandated | Genuine use cases need it, so the cursor abstraction makes at-least-once-with-replay achievable when the upstream is durable. But many upstreams are push-only with no history; mandating reliability would force them to fake it. Servers may return `cursor: null` to opt out. |
+| Webhook subscription identity | `(principal, delivery.url, name, params)`; webhook requires auth; server-derived `id` for routing only | The tuple is everything that semantically defines a subscription, so subscribe is naturally idempotent and there is nothing for the client to generate or persist. The derived `id` is a non-capability routing handle. Webhook requires an authenticated principal so the tuple is not guessable by other tenants; without it, anyone could unsubscribe or rotate another tenant's secret. Server-generated and client-generated `id` schemes were considered; both add state or entropy obligations the tuple makes unnecessary. |
+| Server-side subscription durability | None — push is connection-scoped, webhook is TTL'd soft state, poll is per-request | Clients hold the canonical subscription list and reconstruct server state by re-subscribing. A server crash never orphans a client; a vanished client never leaks server resources. Trade-off: no server-side "list all subscriptions" without per-principal enumeration. |
+| Webhook callback TLS | `https` is MUST | Both event payloads and the `delivery.secret` (in the subscribe request) would otherwise transit in cleartext. No legitimate remote-server deployment lacks TLS in 2026. |
+| Replay bound | Time-floor `maxAge` only; no count bound | Time-anchored start is the universal primitive across replayable systems (Kinesis `AT_TIMESTAMP`, JetStream `by_start_time`, Kafka `offsetsForTimes`, RabbitMQ/Pulsar/PubSub seek-to-time). Count-bounded subscribe ("newest N") requires backward-seek that many upstreams can't do cheaply and has ambiguous which-end semantics. |
+| Cursor advancement during quiet periods | Heartbeat carries cursor (push); refresh response carries cursor (webhook); poll already returns cursor on empty results | Without this, a long quiet stretch leaves the client holding a cursor older than the upstream's retention window, yielding a spurious `truncated: true` even though nothing happened. Reuses existing periodic messages; no new traffic. |
+| `eventId` source | Server-assigned; SHOULD be the upstream's stable identifier | Dual-path delivery (e.g., webhook emit + poll backfill) of the same upstream event must collapse under client-side dedup. SDK auto-generates only when the author supplies none. |
+| Protocol-level flow control | None in v1 | The dominant bottleneck is LLM inference (seconds–minutes per event), not delivery. TCP back-pressure, `nextPollSeconds`, and client-side prioritization are sufficient for the target event rates. Credit-based control can be added later without breaking changes. |
+| New primitive vs extending `resources/subscribe` | New `events/*` primitive | Resources are content-addressed (URI → representation) without parameters or cursors; bolting filter params, replay, and three delivery modes onto them would distort that model more than a parallel primitive costs. Folding `resources/subscribe` into events later is left as an open question. |
+
 ## Appendix: End-to-End Example — GitHub MCP Server (Webhook Delivery)
 
 This walks one concrete topology from upstream source to agent reaction, using webhook delivery via a forward proxy. The MCP server wraps the GitHub API: it receives PR activity from GitHub via GitHub's native repository webhooks (the *upstream* channel — outside this protocol), and delivers it to a forward proxy via MCP webhook (`events/subscribe`). The proxy buffers events and serves them to the client over poll or push. When an event arrives, the client SDK wakes the LLM agent.
@@ -900,7 +913,7 @@ sequenceDiagram
         SDK->>Server: events/subscribe<br/>{name: "pull_request.opened", params: {repo: "acme/webapp"},<br/>delivery: {mode: "webhook", url: "https://proxy/.../hooks", secret: "whsec_..."}}
         Server->>Redis: SETEX sub:{derivedId} {ttl}<br/>{principal, name, params, url, secret}
         Server->>GH: ensure repo webhook registered<br/>(server-internal, idempotent)
-        Server-->>SDK: {id, refreshBefore}
+        Server-->>SDK: {id, refreshBefore, cursor, truncated}
     end
 
     rect rgb(245,250,245)
@@ -908,7 +921,7 @@ sequenceDiagram
         GH->>Server: POST /gh-webhook<br/>{action: "opened", pull_request: {...}}
         Server->>Redis: SCAN sub:* → match repo
         Redis-->>Server: [{id, url, secret}]
-        Server->>Proxy: POST {id, event: {number: 42, title, author, url}, cursor'}<br/>+ HMAC signature
+        Server->>Proxy: POST {eventId, name, timestamp, data: {number: 42, title, author, url}, cursor'}<br/>+ Standard Webhooks signature
         Proxy-->>Server: 200 OK
         Proxy--)SDK: deliver event<br/>(implementation-defined, e.g. poll/push)
         SDK->>LLM: invoke agent with event payload
@@ -918,16 +931,16 @@ sequenceDiagram
         Note over SDK,Redis: Keepalive
         SDK->>Server: events/subscribe (same key — refresh TTL)
         Server->>Redis: EXPIRE sub:{derivedId} {ttl}
-        Server-->>SDK: {refreshBefore'}
+        Server-->>SDK: {refreshBefore', cursor, deliveryStatus}
     end
     Note over Redis: no refresh → key expires,<br/>subscription gone
 ```
 
 The Redis lane is illustrative, not normative. The body of this doc says webhook subscriptions are "in memory with TTL"; that is sufficient for a single-process server. A horizontally scaled server (multiple replicas behind a load balancer) needs *shared* state so any replica can match an incoming upstream event to subscriptions created on another replica — Redis with key TTL is the obvious fit, but any shared store with expiry works. The protocol does not require this state to be *durable*: if it is lost, clients re-create it on their next refresh and the client's persisted cursor covers the gap (for event types backed by a durable upstream).
 
-Note there are *two* webhook hops here, and they are unrelated: GitHub → MCP Server (step 4) is GitHub's native webhook product, configured server-side and outside this spec; MCP Server → Forward Proxy (step 5) is the MCP `events/subscribe` webhook defined above.
+Note there are *two* webhook hops here, and they are unrelated: GitHub → MCP Server (step 5) is GitHub's native webhook product, configured server-side and outside this spec; MCP Server → Forward Proxy (step 8) is the MCP `events/subscribe` webhook defined above.
 
 **Substituting other delivery modes.** Only the *Subscribe* and *Event fires* boxes change; the upstream leg (GitHub → MCP Server) is identical in all three modes.
 
-- **Push** — step 1 becomes `events/stream`; drop the Forward Proxy lane and the Keepalive box; steps 5–7 collapse into a single `notifications/events/event` from server to SDK (see [Push-Based Delivery](#push-based-delivery)).
-- **Poll** — drop step 1 and the Forward Proxy lane; the SDK loops `events/poll` with the subscription inline, and step 5–7 become the poll response (see [Poll-Based Delivery](#poll-based-delivery)).
+- **Push** — step 1 becomes `events/stream`; drop the Forward Proxy lane and the Keepalive box; steps 8–10 collapse into a single `notifications/events/event` from server to SDK (see [Push-Based Delivery](#push-based-delivery)).
+- **Poll** — drop step 1 and the Forward Proxy lane; the SDK loops `events/poll` with the subscription inline, and steps 8–10 become the poll response (see [Poll-Based Delivery](#poll-based-delivery)).
