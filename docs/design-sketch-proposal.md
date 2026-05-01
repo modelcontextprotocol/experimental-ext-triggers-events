@@ -77,9 +77,11 @@ Servers advertise event support in their capabilities:
           "deduplicate_window_seconds": { "type": "integer", "default": 0, "description": "Suppress duplicate alerts within this window" }
         }
       },
-      "payloadSchema": { "..." : "..." }
+      "payloadSchema": { "..." : "..." },
+      "_meta": { "..." : "..." }   // optional; same semantics as on Tool/Resource/Prompt
     }
-  ]
+  ],
+  "nextCursor": "..."   // present when more pages are available; same semantics as tools/list etc.
 }
 ```
 
@@ -184,6 +186,7 @@ Each entry in `events[]`, the params of `notifications/events/event` (plus `requ
 | `timestamp` | string (ISO 8601) | yes | When the event occurred |
 | `data` | object | yes | Payload conforming to the event type's `payloadSchema` |
 | `cursor` | string \| null | no | Subscription position after this event (push/webhook only; poll carries cursor at the response level). `null` when the event type does not support replay — see *Cursor Lifecycle*. |
+| `_meta` | object | no | Reserved for protocol/extension metadata, consistent with `_meta` on other MCP types. Not governed by `payloadSchema`. |
 
 **Notes:**
 
