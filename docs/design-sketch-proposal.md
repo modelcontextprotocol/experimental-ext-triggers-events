@@ -476,7 +476,26 @@ The `events/subscribe` response MAY include a `deliveryStatus` object when refre
 }
 ```
 
+```jsonc
+// Subscription being actively rate-limited (deliveries delayed, not failing)
+{
+  "id": "sub_a3f1c8e2b0d49f7e",
+  "refreshBefore": "2026-02-19T17:00:00Z",
+  "cursor": "cursor_xyz",
+  "truncated": false,
+  "deliveryStatus": {
+    "active": true,
+    "lastDeliveryAt": "2026-02-19T16:28:00Z",
+    "lastError": null,
+    "throttled": true,
+    "retryAfterMs": 60000
+  }
+}
+```
+
 `deliveryStatus` is OPTIONAL — servers MAY omit it entirely. When present, `active` indicates whether the server is currently delivering events (`false` means it has suspended retries after repeated failures; the refresh that returned this status has just reactivated it). `lastError` MUST be a server-generated category string — one of `connection_refused`, `timeout`, `tls_error`, `http_4xx`, `http_5xx`, `challenge_failed` — and MUST NOT include raw response bodies, headers, or status lines from the endpoint, to avoid serving as a response oracle for attacker-chosen URLs. The client can use this information to diagnose connectivity or authentication issues with the webhook endpoint. The same categories also appear as `data.reason` on a `-32015 CallbackEndpointError` returned synchronously from `events/subscribe`.
+
+`throttled` (optional boolean) distinguishes active rate-limiting from failure-driven suspension: `true` means the server is currently limiting outbound deliveries for this subscription — deliveries are being delayed or coalesced, not failing — so the client should not read reduced traffic as "nothing is happening" or as an endpoint problem. `retryAfterMs` (optional integer) accompanies it as a hint for how long the client should expect throttling to last before normal delivery resumes. Both fields are advisory; servers that do not rate-limit outbound deliveries never send them, and a `gap` envelope still covers the case where throttling caused events to be skipped outright.
 
 #### Webhook Security
 
