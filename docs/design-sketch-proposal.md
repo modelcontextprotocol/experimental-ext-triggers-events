@@ -90,10 +90,15 @@ Servers advertise event support in their capabilities:
 - `delivery` lists the delivery modes this event type supports — any non-empty subset of `"poll"`, `"push"`, `"webhook"`. No mode is mandatory. A client that cannot use any of the listed modes cannot subscribe to this event type.
 - `inputSchema` is a JSON Schema describing valid subscription arguments — these may include filters (which narrow the event stream), transforms (which modify payloads), or other server-defined configuration. This mirrors the `inputSchema`/`arguments` pairing on tools for consistency.
 - `payloadSchema` describes the shape of `data` in delivered events.
+- **Schema evolution.** A subscription can outlive the `events/list` response it was created from, so servers SHOULD evolve an event type's `inputSchema` and `payloadSchema` additively for the lifetime of its `name`: new optional fields MAY be added; existing fields SHOULD NOT be removed, renamed, or retyped; enums SHOULD NOT be narrowed; and `inputSchema` SHOULD NOT be tightened such that previously accepted `arguments` become invalid (a webhook refresh re-sends them and would fail with `-32602`). A breaking change SHOULD instead be published under a new event name, served alongside the old one for a migration period, after which the old name is removed (see *Event Type Removal and Breaking Changes*).
 
 ### Dynamic Event Types: `notifications/events/list_changed`
 
-If the set of available event types changes at runtime (e.g., a plugin is loaded, a data source is connected), the server sends a `notifications/events/list_changed` notification. The client SHOULD re-call `events/list` to refresh its event type registry. This is consistent with `notifications/tools/list_changed` and `notifications/resources/list_changed`.
+If the set of available event types, or the descriptor of any of them (`description`, `delivery`, `inputSchema`, `payloadSchema`), changes at runtime (e.g., a plugin is loaded, a data source is connected, a schema gains a field), the server sends a `notifications/events/list_changed` notification. The client SHOULD re-call `events/list` to refresh its event type registry. This is consistent with `notifications/tools/list_changed` and `notifications/resources/list_changed`.
+
+### Event Type Removal and Breaking Changes
+
+When a server stops offering an event type, or changes its `inputSchema` or `payloadSchema` incompatibly in place (contrary to *Schema evolution* above), existing subscriptions to that name no longer hold a valid contract. The server SHOULD end them using each mode's termination signal (see *Authorization*): `notifications/events/terminated` on push streams and a `terminated` envelope to webhook subscriptions. The `error` is `-32011 NotFound` with `data: {"kind": "event"}` when the type was removed, or `-32014 Unsupported` with `data: {"feature": "payloadSchema" | "inputSchema", "reason": "schema_changed"}` when it was changed in place — not `-32012 Forbidden`, since the principal's access is unchanged — so the client SDK re-fetches `events/list` and resubscribes against the current descriptor rather than treating it as an authorization failure. Purely additive changes MUST NOT terminate subscriptions. Poll holds no server-side subscription to terminate: a poll against a removed name already returns `-32011 NotFound`; for an in-place change, a server that wants to force re-discovery MAY mint cursors that encode a schema epoch and answer a stale one with the same `Unsupported` error, otherwise poll clients pick up the change on their next `events/list`.
 
 ## Subscribing and Event Delivery
 
@@ -204,7 +209,7 @@ Push delivery uses a long-lived `events/stream` request — one per subscription
 
 The transport mechanism differs by transport type:
 
-- **Streamable HTTP:** The `events/stream` request is a POST that returns an SSE response stream. This stream carries event notifications (`notifications/events/*`); it is independent of, and does not replace, the transport's existing GET-based SSE stream, which continues to carry non-event server-initiated notifications (`notifications/tools/list_changed`, progress, logging, etc.). The client cancels by aborting the request stream (TCP close on HTTP/1.1, `RST_STREAM` on HTTP/2) — no explicit cancellation message is needed.
+- **Streamable HTTP:** The `events/stream` request is a POST that returns an SSE response stream. This stream carries only this subscription's event notifications (`notifications/events/*`); it is not a general server-to-client channel, and other server-initiated notifications (`notifications/*/list_changed`, progress, logging) continue to use whatever mechanism the base transport provides for them. The client cancels by aborting the request stream (TCP close on HTTP/1.1, `RST_STREAM` on HTTP/2) — no explicit cancellation message is needed.
 - **stdio:** The `events/stream` request is sent on stdin. The server delivers events as JSON-RPC notifications on stdout. Since there is no connection to close, the client cancels by sending `notifications/cancelled` with the request's `id`.
 
 ```mermaid
@@ -260,7 +265,7 @@ If the subscription is invalid (`NotFound`, `Forbidden`, `InvalidParams`, `Unsup
 {"jsonrpc":"2.0","id":1,"result":{"_meta":{}}}
 ```
 
-`notifications/events/error` reports a recoverable failure (e.g., a single upstream fetch failed); the subscription remains active and the server retries and resumes. Only `notifications/events/terminated` (see *Authorization*) ends the subscription. A gap (e.g., the cursor fell outside the upstream's retention window) is *not* an error — the server sends a fresh `notifications/events/active {cursor:<fresh>, truncated:true, _meta.subscriptionId}` and continues delivering (see *Cursor Lifecycle*).
+`notifications/events/error` reports a recoverable failure (e.g., a single upstream fetch failed); the subscription remains active and the server retries and resumes. Only `notifications/events/terminated` ends the subscription (see *Authorization* and *Event Type Removal and Breaking Changes*). A gap (e.g., the cursor fell outside the upstream's retention window) is *not* an error — the server sends a fresh `notifications/events/active {cursor:<fresh>, truncated:true, _meta.subscriptionId}` and continues delivering (see *Cursor Lifecycle*).
 
 On Streamable HTTP, notifications are SSE `data:` frames; when the server terminates the stream it sends the `StreamEventsResult` as the final `data:` frame, but when the client terminates by aborting the request stream no result can be sent (see *Cancellation*). On stdio, notifications are newline-delimited JSON messages on stdout.
 
@@ -373,7 +378,7 @@ Every webhook subscription has a lifetime negotiated at subscribe time: the clie
 - restart recovery via the refresh cycle no longer applies — the server MUST persist no-expiry subscriptions across restarts, because a client that never refreshes will never detect (or repair) a silently dropped one;
 - TTL expiry no longer garbage-collects orphans or dead endpoints — the server MAY drop a no-expiry subscription after sustained delivery failure (server-defined window), and SHOULD attempt a `terminated` envelope when it does.
 
-Even with no expiry, clients SHOULD still re-call `events/subscribe` occasionally: the refresh response is where the cursor advances during quiet periods, where `deliveryStatus` surfaces delivery problems, and where suspended delivery reactivates (see *Webhook Event Delivery*). The difference is that correctness no longer depends on it.
+Even with no expiry, clients SHOULD still re-call `events/subscribe` (and `events/list`) occasionally: the refresh response is where the cursor advances during quiet periods, where `deliveryStatus` surfaces delivery problems, and where suspended delivery reactivates (see *Webhook Event Delivery*), and a periodic `events/list` bounds how long a descriptor change can go unnoticed by a client with no live connection. The difference is that correctness no longer depends on it.
 
 #### Subscription Identity
 
@@ -890,6 +895,7 @@ The spec does not mandate specific governance mechanisms but is designed to enab
 - **Cross-server event routing.** No mechanism for one server's events to trigger another server's tools. This is an application/orchestration concern.
 - **Event-bound prompts.** Prompt templates that auto-instantiate on events. Deferred to a future version.
 - **Guaranteed delivery.** All three modes provide at-least-once delivery when the cursor is backed by a durable upstream and the client replays from its last known cursor on reconnect/restart. Emit-only event types are at-most-once across server restarts — the in-memory buffer and its cursors do not survive (see *Emit-only event types*). Exactly-once requires application-level deduplication via `eventId`.
+- **Event schema versioning.** No `schemaVersion` field on event types or occurrences, and no subscribe-time version negotiation. v1 relies on additive schema evolution plus server-initiated termination on removal or breaking change (see *Schema evolution* and *Event Type Removal and Breaking Changes*). An in-band schema fingerprint (e.g., a `payloadSchema` hash carried in `_meta` on the descriptor and echoed on each `EventOccurrence`) is a possible additive follow-on for clients that want exact drift detection, best revisited once the base protocol settles tool naming and versioning.
 
 ## Open Questions
 
