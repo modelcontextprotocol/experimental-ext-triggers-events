@@ -8,5 +8,7 @@
 # https://github.com/modelcontextprotocol/access
 
 # Default owners for all files in the repository
-# The Triggers & Events Working Group has day-to-day governance
-* @modelcontextprotocol/triggers-events-wg
+# The Triggers & Events Working Group leads have day-to-day governance.
+# Working group members can push branches and open pull requests, but a
+# merge needs approval from a lead.
+* @modelcontextprotocol/triggers-events-wg-leads
