@@ -108,6 +108,14 @@ There are three delivery modes with different subscription mechanisms:
 - **Push mode:** Client opens a long-lived `events/stream` request per subscription. Events are delivered on the SSE response stream (HTTP) or as notifications on stdout (stdio). Closing the request stream terminates the subscription. Server state is scoped to request lifetime.
 - **Webhook mode:** Client calls `events/subscribe` to register a callback URL. The server POSTs events to that URL as they occur. Subscriptions carry a TTL negotiated at subscribe time — the client suggests a lifetime, the server grants one (possibly no expiry; see *Subscription TTL*). Unless granted no expiry, the client must periodically refresh by re-calling `events/subscribe` before the TTL expires; if it stops refreshing, the subscription expires and the server reclaims resources. Designed for remote servers where maintaining a long-lived connection is impractical.
 
+### Read-Only Subscription Semantics
+
+Event subscriptions MUST be read-only and non-destructive with respect to the underlying application state and user data. This requirement applies to the full subscription lifecycle: setup, refresh, polling, streaming, event processing and delivery, reconnects and replay, and cleanup on cancellation or expiry. It applies to every supported argument combination and delivery mode, including server lifecycle hooks.
+
+Servers MUST NOT use subscription operations to create, modify, or delete application data, change memberships or permissions, or initiate application work. For example, subscribing to messages MUST NOT mark them as read, join or leave a channel, or send a message; subscribing to incidents MUST NOT acknowledge or resolve them. Any such action requires a separate, explicitly authorized operation, such as a tool call.
+
+State needed solely to observe and deliver the requested event stream MAY be maintained: subscription records, leases, cursors, delivery queues, and listener or webhook registrations. Creating and cleaning up this subscription machinery does not violate the read-only requirement, provided it does not change the observed application state, grant new access, or disrupt other subscriptions. Access needed to observe the source must already be authorized; subscribing is not a way to acquire it.
+
 ### Error Codes
 
 | Code | Message | Meaning |
@@ -720,18 +728,21 @@ For servers wrapping upstreams that *do* offer a durable cursor (Gmail historyId
 **Subscription lifecycle hooks.** For events where the upstream source must be configured per subscription (e.g., "watch this Slack channel"), the server needs to know when subscriptions are added and removed. The SDK provides lifecycle hooks:
 
 ```python
+# Illustrative local listener registry over an already-authorized message feed.
 @server.on_subscribe("slack.message")
 async def on_subscribe(context, arguments, subscription_id):
-    """Set up upstream listener for this subscription's arguments."""
-    await slack.join_channel(arguments["channel"])
+    """Observe an accessible channel without changing membership."""
+    await listeners.add(subscription_id, channel=arguments["channel"])
 
 @server.on_unsubscribe("slack.message")
 async def on_unsubscribe(context, arguments, subscription_id):
-    """Tear down upstream listener."""
-    await slack.leave_channel(arguments["channel"])
+    """Remove only this subscription's listener."""
+    await listeners.remove(subscription_id)
 ```
 
 These hooks are called by the SDK across all delivery modes. The server author writes the upstream setup/teardown logic once; the SDK handles the delivery mechanics. Servers SHOULD enforce the subscription limit (`ResourceExhausted`) before invoking `on_subscribe`, so a rejected subscription never provisions upstream resources.
+
+The hooks and the event-checking function MUST obey *Read-Only Subscription Semantics*. In particular, channel membership must be established separately when needed; neither subscribing nor unsubscribing changes it.
 
 **Unsubscribe timing by mode.** Push and webhook have explicit end-of-life signals — push fires `on_unsubscribe` when the stream closes, webhook when `events/unsubscribe` is called or the TTL lapses. Poll does not: the client simply stops calling `events/poll`, and the server never sees a goodbye. To prevent poll-provisioned upstream resources from leaking, the SDK treats poll subscriptions as leased. The lease is keyed on `(principal-or-null, eventName, canonicalHash(arguments))` — on unauthenticated servers all callers share one lease per `(name, arguments)`. `on_subscribe` fires the first time a given key appears in a poll request; each subsequent poll for that key renews the lease; `on_unsubscribe` fires when the lease expires without renewal. This lease table is ephemeral SDK state, not protocol state: it is never persisted, and a server restart simply re-fires `on_subscribe` on the next poll. The lease window is SDK-configurable and SHOULD default to a small multiple of the server's typical `nextPollMs` so that a well-behaved client never lapses between polls:
 
@@ -819,6 +830,7 @@ The threats this extension is designed to defend against, and the mechanism addr
 | PII / sensitive-data exposure in event infrastructure (logs, queues, buffers) | Payload minimality — deliver only triage fields (e.g. sender, subject, id) and fetch full content via tools on demand. *(Payload Minimality)* |
 | Unauthorized subscription, or continued delivery after access is revoked | Subscribe-time permission check (`-32024 Forbidden`); periodic delivery-time re-verification; a `terminated` envelope ends the subscription when access is lost. *(Authorization)* |
 | Treating event receipt as authority to act | Action-time authorization — the agent's response to an event goes through normal MCP authorization; receipt grants no privilege. *(Authorization)* |
+| Unexpected application changes during subscription setup, delivery, or cleanup | Subscription operations must be read-only and non-destructive; application mutations require separate authorization. *(Read-Only Subscription Semantics)* |
 | SSRF / DNS rebinding (server coerced into requesting internal hosts) | Delivery-time IP validation against the IANA special-purpose registries, connecting to the validated IP with the original Host/SNI, and no redirects; optional callback-URL allowlist. *(Webhook Security → SSRF prevention)* |
 | Reflection / amplification DDoS (attacker subscribes a victim's URL) | Mandatory endpoint verification (challenge handshake, allowlist, out-of-band confirmation, or receiver-published well-known document) before activating delivery, cached per `(principal, url)`; subscribe and per-destination rate limits. *(Endpoint verification)* |
 | Forged / spoofed deliveries (endpoint deceived into processing fake events) | Per-subscription HMAC (Standard Webhooks `v1,`); receiver verifies the signature before processing. *(Signature scheme)* |
