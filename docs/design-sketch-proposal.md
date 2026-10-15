@@ -774,6 +774,24 @@ await sub.cancel()
 
 The SDK manages delivery mode selection, poll loops, push stream lifecycle, webhook refresh cycles, cursor tracking, deduplication by `eventId`, gap/`truncated` handling, and reconnection — all transparently.
 
+### Exposing Subscriptions to the Model
+
+The harness can choose among different strategies for exposing events to the model. The model needs a tool to request a subscription, and the harness maps that request to the client SDK. The options below differ in how the model selects the server, event type, and subscription arguments; none is prescribed here.
+
+| Option | Tool inputs | Advantages | Trade-offs |
+|---|---|---|---|
+| **1. One global subscription tool** | Server, event name, and subscription arguments | One extra tool for all servers, with a consistent interface. | The model must select the server and event, and may miss the connection to the server's other tools. |
+| **2. One subscription tool per MCP server** | Event name and subscription arguments | One extra tool per server, grouped with that server's other tools. | The tool must describe multiple event types and argument schemas. A real server tool may already be named `subscribe`. |
+| **3. One subscription tool per event type** | Subscription arguments | Each tool describes one event and its arguments, grouped with related server tools. | More events mean more tools and model context. Generated names can collide with existing tools or with each other. |
+
+The harness creates these tools for the model; they do not require new server-side `tools/call` operations. The SDK still chooses poll, push, or webhook, whichever strategy is used.
+
+**Names and routing.** Options 2 and 3 must not replace existing tools. If a server already has a tool named `subscribe`, adding another with the same name still conflicts: a server prefix alone is not enough. A separate namespace or stable aliases could avoid this; no convention is prescribed here. Option 1 also needs a unique tool name. In every option, map calls to a known server connection using a stable identifier, rather than an ambiguous display name or arbitrary URL.
+
+**Discovery and schemas.** The model needs event names, descriptions, and argument schemas. Options 1 and 2 can include them in the tool definition or provide a separate discovery step; option 3 puts each event's schema directly in its tool. The harness validates arguments against `inputSchema` and refreshes its tool definitions and mappings on `notifications/events/list_changed`. Generated names must also account for the model's tool-name restrictions.
+
+**Lifecycle and policy.** The call establishes a subscription; events arrive separately as they occur. The harness reports whether the subscription started and provides a way to inspect and cancel it. Delivery configuration, callback secrets, cursors, and reconnects stay in the SDK. Apply the same authorization and side-effect checks to the selected server, event, and arguments before starting, whichever option is used. Receiving an event does not authorize an action in response.
+
 ### Delivery Mode Selection
 
 The SDK intersects the event type's advertised `delivery` list with the modes the client is configured to use, and picks in this preference order:
