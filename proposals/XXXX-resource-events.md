@@ -24,7 +24,7 @@ We bring this proposal to the Tasks and Events working group for discussion, and
 
 ## References
 
-- **SEP-3415, Events,** [modelcontextprotocol#3415](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/3415), a draft, by reference at commit `b08e4f9`. This extension takes its `events/subscribe` and its webhook delivery, and sends an event of its own, `mcp.resource.collection.updated` rather than the `mcp.resource.updated` its Open Question 2 sketches.
+- **SEP-3415, Events,** [modelcontextprotocol#3415](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/3415), a draft, by reference at commit `b08e4f9`. This extension takes its subscriptions and delivery as they stand, and sends an event of its own, `mcp.resource.collection.updated` rather than the `mcp.resource.updated` its Open Question 2 sketches.
 - **The Filesystems strawman,** [experimental-ext-filesystems#2](https://github.com/modelcontextprotocol/experimental-ext-filesystems/pull/2), the Filesystems working group's draft of resource operations, at commit `db67f78`, which the rest of this proposal calls "the strawman". It adds `resources/stat`, `resources/create`, `resources/update` and `resources/delete`. Each resource has a `revision`, a write names the one it expects as `ifMatch`, and a write's result holds a change-set entry for each resource it changed, such as `{uri, effect: "updated", previousRevision, revision}`. This extension takes its `revision` and its change-set entry, and the prototype builds its four methods.
 - **The Filesystems problem statements,** [experimental-ext-filesystems](https://github.com/modelcontextprotocol/experimental-ext-filesystems/blob/main/docs/problem-statements.md), that working group's framing of its work. Problem Statement 6 asks a proposal to "Decide whether a client can subscribe to a directory", and asks "Does a client need ordering between its write response and the resulting notification?" A collection answers the first (R24), and revisions the second, since a client orders messages by revision rather than arrival (R15). This extension offers both for that group to weigh.
 - **MCP 2026-07-28,** [the specification](https://modelcontextprotocol.io/specification/2026-07-28), the revision this extension builds on, for `resources/read`, pagination and `CacheableResult`.
@@ -387,7 +387,7 @@ covers(listed, clientTemplate):
 
 ### Declaring the extension
 
-- **R20.** A server declares this extension in `capabilities.extensions` under a provisional identifier, `io.modelcontextprotocol/resource-events`, as SEP-2133 asks. A server that declares it MUST serve `resources/collection/read` and `resources/collection/catchup`, and list `mcp.resource.collection.updated` in `events/list` with webhook delivery. The extension reserves the prefix `resources/collection/` for its methods, beside core's and the strawman's under `resources/`. The event's name waits on Open Question 2's decision about an `mcp.*` prefix.
+- **R20.** A server declares this extension in `capabilities.extensions` under a provisional identifier, `io.modelcontextprotocol/resource-events`, as SEP-2133 asks. A server that declares it MUST serve `resources/collection/read` and `resources/collection/catchup`, and list `mcp.resource.collection.updated` in `events/list`, with whichever of SEP-3415's delivery modes it offers. The extension reserves the prefix `resources/collection/` for its methods, beside core's and the strawman's under `resources/`. The event's name waits on Open Question 2's decision about an `mcp.*` prefix.
 
 ### uriGlob, later
 
@@ -445,7 +445,7 @@ None. The extension adds two methods and one event, and binds only a server that
 
 ## Security Implications
 
-This extension sends its events by SEP-3415's webhook delivery as it stands, so that SEP's rules on callback URLs, signing and endpoint verification cover every POST. It adds four points of its own:
+This extension sends its events by SEP-3415's delivery modes as they stand, so that SEP's rules cover every delivery, as its rules on callback URLs, signing and endpoint verification cover every webhook POST. It adds four points of its own:
 
 - **Events carry no contents** (R10), so a delivery that reaches the wrong receiver reveals uris and revisions, never what a resource holds.
 - **A catch-up or a collection read is authorized as a `resources/read`** of each resource it covers (R13, R22), so catch-ups and reads MUST cover only what the principal may read, and events SHOULD (R25).
