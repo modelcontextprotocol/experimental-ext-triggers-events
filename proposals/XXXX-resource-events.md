@@ -10,7 +10,7 @@
 
 ## Abstract
 
-This extension lets an MCP client keep copies of resources current by webhook. A server records each change to its resources at a moment on a timeline, a string that sorts after every moment before it, such as `"108"`. For each change, it sends `mcp.resource.collection.updated` through the webhook delivery of SEP-3415, Events, to each subscription covering a resource the change touched. The event names the collection the subscription watches and each resource in it that changed, with its new revision, and carries none of their contents.
+This extension lets an MCP client keep copies of resources current. A server records each change to its resources at a moment on a timeline, a string that sorts after every moment before it, such as `"108"`. For each change, it sends `mcp.resource.collection.updated` through the webhook delivery of SEP-3415, Events, to each subscription covering a resource the change touched. The event names the collection the subscription watches and each resource in it that changed, with its new revision, and carries none of their contents.
 
 A client that already holds each named revision, such as the client that made the change, skips the event. Any other catches up with `resources/collection/catchup`, which brings every change to the collection after the moment the client is caught up to, each as contents or a patch. 
 
