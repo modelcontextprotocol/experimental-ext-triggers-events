@@ -369,7 +369,7 @@ A uriGlob is a third kind of uri-specification. A glob is the familiar way to wr
 
 ## Rationale
 
-Each decision keeps the number the rules cite it by.
+Each decision keeps the number the rules cite it by, and opens by restating its rule, so it reads without scrolling back to the Specification.
 
 ### Subscribing and events
 
