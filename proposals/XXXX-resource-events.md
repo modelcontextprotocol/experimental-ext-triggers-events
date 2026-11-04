@@ -1,8 +1,8 @@
-# SEP-XXXX: Resource Webhooks on Events
+# SEP-XXXX: Resource Events
 
 - **Status**: Draft
 - **Type**: Extensions Track
-- **Extension Identifier**: `io.modelcontextprotocol/resource-webhooks`
+- **Extension Identifier**: `io.modelcontextprotocol/resource-events`
 - **Created**: 2026-10-31
 - **Author(s)**: Larry Maccherone (@lmaccherone)
 - **Sponsor**: None (seeking sponsor)
@@ -23,7 +23,7 @@ We bring this proposal to the Tasks and Events working group for discussion, and
 ## References
 
 - **SEP-3415, Events,** [modelcontextprotocol#3415](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/3415), a draft, by reference at commit `b08e4f9`. This extension takes its `events/subscribe` and its webhook delivery, and sends an event of its own, `mcp.resource.collection.updated` rather than the `mcp.resource.updated` its Open Question 2 sketches.
-- **The Filesystems strawman,** [experimental-ext-filesystems#2](https://github.com/modelcontextprotocol/experimental-ext-filesystems/pull/2), the Filesystems working group's draft of resource operations, at commit `8d0fa88`, which the rest of this proposal calls "the strawman". It adds `resources/stat`, `resources/create`, `resources/update` and `resources/delete`. Each resource has a `revision`, a write names the one it expects as `ifMatch`, and a write's result holds a change-set entry for each resource it changed, such as `{uri, effect: "updated", previousRevision, revision}`. This extension takes its `revision` and its change-set entry, and the prototype builds its four methods.
+- **The Filesystems strawman,** [experimental-ext-filesystems#2](https://github.com/modelcontextprotocol/experimental-ext-filesystems/pull/2), the Filesystems working group's draft of resource operations, at commit `db67f78`, which the rest of this proposal calls "the strawman". It adds `resources/stat`, `resources/create`, `resources/update` and `resources/delete`. Each resource has a `revision`, a write names the one it expects as `ifMatch`, and a write's result holds a change-set entry for each resource it changed, such as `{uri, effect: "updated", previousRevision, revision}`. This extension takes its `revision` and its change-set entry, and the prototype builds its four methods.
 - **The Filesystems problem statements,** [experimental-ext-filesystems](https://github.com/modelcontextprotocol/experimental-ext-filesystems/blob/main/docs/problem-statements.md), that working group's framing of its work. Problem Statement 6 asks a proposal to "Decide whether a client can subscribe to a directory", and asks "Does a client need ordering between its write response and the resulting notification?" A collection answers the first (R24), and revisions the second, since a client orders messages by revision rather than arrival (R15). This extension offers both for that group to weigh.
 - **MCP 2026-07-28,** [the specification](https://modelcontextprotocol.io/specification/2026-07-28), the revision this extension builds on, for `resources/read`, pagination and `CacheableResult`.
 - **SEP-2640, Skills over MCP,** [the extension](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/seps/2640-skills-extension.md), Final, which serves a skill's files as resources, such as `skill://pdf-processing/scripts/extract.py`. A client that loaded a skill can watch its files with this extension, as § *Use cases* shows.
@@ -385,7 +385,7 @@ covers(listed, clientTemplate):
 
 ### Declaring the extension
 
-- **R20.** A server declares this extension in `capabilities.extensions` under a provisional identifier, `io.modelcontextprotocol/resource-webhooks`, as SEP-2133 asks. A server that declares it MUST serve `resources/collection/read` and `resources/collection/catchup`, and list `mcp.resource.collection.updated` in `events/list` with webhook delivery. The extension reserves the prefix `resources/collection/` for its methods, beside core's and the strawman's under `resources/`. The event's name waits on Open Question 2's decision about an `mcp.*` prefix.
+- **R20.** A server declares this extension in `capabilities.extensions` under a provisional identifier, `io.modelcontextprotocol/resource-events`, as SEP-2133 asks. A server that declares it MUST serve `resources/collection/read` and `resources/collection/catchup`, and list `mcp.resource.collection.updated` in `events/list` with webhook delivery. The extension reserves the prefix `resources/collection/` for its methods, beside core's and the strawman's under `resources/`. The event's name waits on Open Question 2's decision about an `mcp.*` prefix.
 
 ### uriGlob, later
 
@@ -463,7 +463,7 @@ A client library, `src/client/copies.ts`, keeps copies by the client's rules: R9
 
 ### Tested, and not yet tested
 
-- **456 tests pass,** and a check fails the run unless a passing test names every rule above but R25. Each new test was mutation-checked: broken code turned it red.
+- **457 tests pass,** and a check fails the run unless a passing test names every rule above but R25. Each new test was mutation-checked: broken code turned it red.
 - **Each MUST of SEP-3415's that the prototype uses has a test.**
 - **MCP's conformance suite,** `@modelcontextprotocol/conformance` 0.2.0-alpha.12 at revision 2026-07-28, passes against A and against the client, with a baseline that lists the features neither offers, such as prompts.
 - **A deployed tier runs on Cloudflare.** Two clients read the tickets, subscribe and catch up. One closes a ticket and skips its own event, and the other catches up with a merge patch.
