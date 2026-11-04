@@ -10,13 +10,15 @@
 
 ## Abstract
 
-This extension lets an MCP client keep copies of resources current. A server records each change to its resources at a moment on a timeline, a string that sorts after every moment before it, such as `"108"`. For each change, it sends `mcp.resource.collection.updated` through the webhook delivery of SEP-3415, Events, to each subscription covering a resource the change touched. The event names the collection the subscription watches and each resource in it that changed, with its new revision, and carries none of their contents.
+This extension lets an MCP client keep copies of resources current. A server records each change to its resources at a moment on a timeline, a string that sorts after every moment before it, such as `"108"`. For each change, it sends `mcp.resource.collection.updated`, an event of SEP-3415's Events extension, to each subscription covering a resource the change touched. The event names the collection the subscription watches and each resource in it that changed, with its new revision, and carries none of their contents.
 
 A client that already holds each named revision, such as the client that made the change, skips the event. Any other catches up with `resources/collection/catchup`, which brings every change to the collection after the moment the client is caught up to, each as contents or a patch. 
 
 A new client first reads the collection with `resources/collection/read`. Writes use the Filesystems working group's strawman methods, and a resource's revision is the moment it last changed.
 
 An event carries no state, so a lost, repeated or late one does no harm: the next catch-up brings whatever it missed. A working prototype builds all of it, as § *Reference Implementation* describes.
+
+While the prototype and § *Motivation* mention webhooks explicitly, nothing in this proposal prevents its event from being delivered over an SSE stream, by SEP-3415's push delivery. Further, the proposal and the prototype both support a client that polls, with no stream at all (§ *Use cases*).
 
 We bring this proposal to the Tasks and Events working group for discussion, and are looking for a sponsor.
 
@@ -47,7 +49,7 @@ A client watching resources today has four problems:
 
 SEP-3415's Open Question 2 sketches a minimal resource subscription over Events, with "a reserved `mcp.resource.updated` event type whose arguments are `{uri}`", re-expressing core's `notifications/resources/updated`, which names one changed resource. This extension leaves that event to Open Question 2, and sends its own, `mcp.resource.collection.updated`, naming a collection and every resource in it that one change touched (D19).
 
-**However, a resource is state, and a watcher cares only about the latest version, not every change.** A receiver that was down while a ticket was edited, reopened and closed needs only the closed ticket. On SEP-3415's thread on 2026-10-16, Peter Alexander (@pja-ant) [wrote](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/3415#issuecomment-6215654779) that watching state and consuming messages "will need different handling and different APIs". The two "should likely share a bunch of the same machinery", he went on, but whether they should share an API "requires some thought and discussion". Here the shared machinery is the event, delivered by webhook, which carries only which resources changed and at which moment, and the different API is the catch-up, which brings the newest values. SEP-3415 itself points this way: servers "SHOULD keep event payloads minimal", agents that need stronger guarantees should "use tools to read authoritative state", and servers "MAY implement resource watching through events".
+**However, a resource is state, and a watcher cares only about the latest version, not every change.** A receiver that was down while a ticket was edited, reopened and closed needs only the closed ticket. On SEP-3415's thread on 2026-10-16, Peter Alexander (@pja-ant) [wrote](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/3415#issuecomment-6215654779) that watching state and consuming messages "will need different handling and different APIs". The two "should likely share a bunch of the same machinery", he went on, but whether they should share an API "requires some thought and discussion". Here the shared machinery is the event, which carries only which resources changed and at which moment, and the different API is the catch-up, which brings the newest values. SEP-3415 itself points this way: servers "SHOULD keep event payloads minimal", agents that need stronger guarantees should "use tools to read authoritative state", and servers "MAY implement resource watching through events".
 
 ### Why is this different from task state sync?
 
