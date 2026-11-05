@@ -465,6 +465,8 @@ This extension sends its events by SEP-3415's delivery modes as they stand, so t
 
 A client library, `src/client/copies.ts`, keeps copies by the client's rules: R9, R11, R12, R15, R16, R18, R19, R21 and R23. A serves two layouts in its tests. One puts tickets and notes on one timeline and also lists `{type}/{id}`. The other gives each its own timeline, so closing a ticket closes its note at a moment on each, which breaks R4 on purpose, to test a write that commits once per timeline. The deployed Worker serves the first.
 
+An implementation in an official SDK comes next, since an Extensions Track SEP needs one before review. It can go in the TypeScript SDK, or build on [python-sdk#3822](https://github.com/modelcontextprotocol/python-sdk/pull/3822), which adds SEP-3415's poll and webhook delivery to the Python SDK, the delivery this extension's events go out by.
+
 ### Tested, and not yet tested
 
 - **463 tests pass,** and a check fails the run unless a passing test names every rule above but R25. Each new test was mutation-checked: broken code turned it red.
