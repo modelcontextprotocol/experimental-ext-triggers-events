@@ -206,8 +206,8 @@ Y already holds ticket-3, the event's one change, at `"108"`, so it skips the ca
 {"changes": [
   {"uri": "tickets/ticket-3", "effect": "updated",
    "previousRevision": "101", "revision": "108",
-   "patchMimeType": "application/merge-patch+json",
-   "patch": {"status": "closed"}}],
+   "patch": {"mimeType": "application/merge-patch+json",
+             "text": "{\"status\":\"closed\"}"}}],
  "hasMore": false, "nextFrom": "108", "nextPollMs": 30000}
 ```
 
@@ -275,7 +275,7 @@ A catch-up on `{type}/{id}` brings ticket-9 and its note as they stood at one mo
 
 ### What a catch-up brings
 
-- **R19.** Each entry in `changes` is one resource's change from `from` to the catch-up's `nextFrom` (R13): the strawman's change-set entry, with contents added. `previousRevision` is the resource's revision at `from`, absent if it did not exist then. `effect` is `deleted` if the change ends with the resource gone, else `created` if it did not exist at `from`, else `updated`. A non-deletion MUST carry `contents`, one `TextResourceContents` or `BlobResourceContents`, or a `patch` from the contents at `previousRevision`, with its `patchMimeType`, in a listed format that applies. A merge patch ([RFC 7396](https://www.rfc-editor.org/rfc/rfc7396)) applies to one `application/json` text entry, and patches its parsed `text`. JSON-based patches travel as JSON, others as strings. The server MUST send `contents` when no listed format applies, when there is no `previousRevision`, or when it no longer keeps those contents, and MAY send them whenever they're smaller than the patch.
+- **R19.** Each entry in `changes` is one resource's change from `from` to the catch-up's `nextFrom` (R13): the strawman's change-set entry, with contents added. `previousRevision` is the resource's revision at `from`, absent if it did not exist then. `effect` is `deleted` if the change ends with the resource gone, else `created` if it did not exist at `from`, else `updated`. A non-deletion MUST carry `contents`, one `TextResourceContents` or `BlobResourceContents`, or a `patch` from the contents at `previousRevision`, in a listed format that applies. A `patch` takes the shape of a strawman write's `contents`, a `text` or a `blob` with no `uri`, whose `mimeType` names the patch's format (D26). A merge patch ([RFC 7396](https://www.rfc-editor.org/rfc/rfc7396)) applies to one `application/json` text entry, and patches its parsed `text`. The server MUST send `contents` when no listed format applies, when there is no `previousRevision`, or when it no longer keeps those contents, and MAY send them whenever they're smaller than the patch.
   - A client MUST apply a patch only to a copy at its `previousRevision`. Otherwise it reads the resource (D2).
 
 ### Less common cases, most likely first
@@ -324,7 +324,7 @@ X then catches up from `"107"`:
 ```jsonc
 {"uri": "tickets/ticket-3", "effect": "updated",
  "previousRevision": "101", "revision": "110",    // ticket-3 as of "107"
- "patchMimeType": "application/merge-patch+json", "patch": {...}}
+ "patch": {"mimeType": "application/merge-patch+json", "text": "..."}}
 // X's copy is at "109", not "101", so X reads ticket-3 with resources/read.
 ```
 
@@ -419,6 +419,8 @@ Each decision keeps the number the rules cite it by, and opens by restating its 
 
 **D2. A patch starts from `previousRevision`.** A catch-up's patch applies to the resource as it stood at the client's `from`, and a client whose copy is at another revision reads the resource instead (R19). Patching from each copy's own revision would need the server to learn every copy's revision, which a catch-up never sends. Sending contents only would give up much of the saving.
 
+**D26. A patch is shaped as a write's contents.** A `patch` is `{mimeType, text}` or `{mimeType, blob}`, as a strawman write's `contents` is, with its `mimeType` naming the patch's format (R19). A media type names a patch's format as it names a resource's, so a change carries its `contents` or its `patch` in one shape, much as HTTP's PATCH sends its patch as a body under its `Content-Type`. A binary patch format, such as VCDIFF for a blob, goes in `blob`. The cost is escaping a JSON patch's quotes. Carrying a JSON-based patch as JSON, beside a `patchMimeType`, reads better, but decodes the field two ways, by whether the format is JSON-based, and leaves it with no type a schema can check. The strawman defers patches, so its write `contents` is the nearest shape to match.
+
 **D4. A `from` too old gets `momentExpired`.** The client then starts over (R21), as Kubernetes answers a watch from a compacted `resourceVersion` with `410 Gone`, and core an expired cursor with `-32602`. A flag on an ordinary result carrying the whole current state, or SEP-3415's `truncated: true`, is a signal a client could miss, and so keep copies of resources since deleted.
 
 **D12. A catch-up's result is a plain result, and paces polling with `nextPollMs`.** A client that polls waits the result's `nextPollMs`, as in SEP-3415's poll mode (R13, R14). Core's `CacheableResult` would serve badly: its `ttlMs` is a freshness hint, which clients "SHOULD NOT treat … as a polling interval", and a cache keyed on the request could answer step 6's catch-up with step 3's empty result, since both send `from` `"107"`. A rule that a client never answers a catch-up from a cache would bind no gateway that follows core, and with no pacing field, a server would have no way to slow clients that poll. A collection read stays a `CacheableResult` (R22), since a cached read is an older snapshot whose `nextFrom` matches it.
@@ -465,7 +467,7 @@ A client library, `src/client/copies.ts`, keeps copies by the client's rules: R9
 
 ### Tested, and not yet tested
 
-- **457 tests pass,** and a check fails the run unless a passing test names every rule above but R25. Each new test was mutation-checked: broken code turned it red.
+- **460 tests pass,** and a check fails the run unless a passing test names every rule above but R25. Each new test was mutation-checked: broken code turned it red.
 - **Each MUST of SEP-3415's that the prototype uses has a test.**
 - **MCP's conformance suite,** `@modelcontextprotocol/conformance` 0.2.0-alpha.12 at revision 2026-07-28, passes against A and against the client, with a baseline that lists the features neither offers, such as prompts.
 - **A deployed tier runs on Cloudflare.** Two clients read the tickets, subscribe and catch up. One closes a ticket and skips its own event, and the other catches up with a merge patch.
