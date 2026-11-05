@@ -467,7 +467,7 @@ A client library, `src/client/copies.ts`, keeps copies by the client's rules: R9
 
 ### Tested, and not yet tested
 
-- **460 tests pass,** and a check fails the run unless a passing test names every rule above but R25. Each new test was mutation-checked: broken code turned it red.
+- **461 tests pass,** and a check fails the run unless a passing test names every rule above but R25. Each new test was mutation-checked: broken code turned it red.
 - **Each MUST of SEP-3415's that the prototype uses has a test.**
 - **MCP's conformance suite,** `@modelcontextprotocol/conformance` 0.2.0-alpha.12 at revision 2026-07-28, passes against A and against the client, with a baseline that lists the features neither offers, such as prompts.
 - **A deployed tier runs on Cloudflare.** Two clients read the tickets, subscribe and catch up. One closes a ticket and skips its own event, and the other catches up with a merge patch.
